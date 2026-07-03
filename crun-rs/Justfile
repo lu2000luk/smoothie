@@ -1,0 +1,16 @@
+submodule:
+    git submodule update --init --recursive
+
+config:
+    cd ./vendor/crun/ && ./autogen.sh
+    cd ./vendor/crun/ && ./configure --enable-shared
+    cd ./vendor/crun/ && make -j$(nproc)
+
+debian-install: 
+    sudo apt install -y libjson-c-dev autoconf automake libtool pkg-config libcap-dev libseccomp-dev libsystemd-dev clang llvm libclang-dev
+
+build:
+    cargo build --release
+
+clean-rs:
+    cargo clean -p crun-rs
