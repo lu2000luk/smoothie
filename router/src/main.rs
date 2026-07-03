@@ -1,4 +1,4 @@
-use actix_web::{App, HttpResponse, HttpServer, Responder, get, http::header::ALLOW, web};
+use actix_web::{App, HttpResponse, HttpServer, Responder, get, web};
 use moka::future::Cache;
 use r2d2::{Pool, PooledConnection};
 use redis::Commands;
@@ -7,7 +7,6 @@ use std::{
     sync::{LazyLock, OnceLock},
     time::{Duration, Instant},
 };
-use tokio::time::error::Elapsed;
 
 static ALLOW_CACHE: LazyLock<Cache<String, bool>> = LazyLock::new(|| {
     Cache::builder()
