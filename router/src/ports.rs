@@ -1,7 +1,7 @@
 use std::sync::OnceLock;
 use tokio::{net::TcpListener, sync::Mutex};
 
-const PREPARE_NEXT_PORTS: i16 = 20;
+const PREPARE_NEXT_PORTS: i16 = 50;
 const PORT_RANGE_START: i16 = 3000;
 const PORT_RANGE_END: i16 = 16000;
 
