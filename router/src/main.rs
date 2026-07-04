@@ -1,3 +1,5 @@
+mod ports;
+
 use actix_web::{App, HttpResponse, HttpServer, Responder, get, web};
 use moka::future::Cache;
 use r2d2::{Pool, PooledConnection};
@@ -7,6 +9,8 @@ use std::{
     sync::{LazyLock, OnceLock},
     time::{Duration, Instant},
 };
+
+use crate::ports::generate_ports;
 
 static ALLOW_CACHE: LazyLock<Cache<String, bool>> = LazyLock::new(|| {
     Cache::builder()
@@ -109,6 +113,7 @@ struct ServerConfig {
     id: String,
     address: String,
     tunnel: bool,
+    if_tunnel_supervisor_address: Option<String>,
     power: u32,
 }
 
@@ -160,6 +165,8 @@ async fn main() -> std::io::Result<()> {
 
     let port = config.port.unwrap_or(8080);
     println!("Starting server: http://localhost:{}", port);
+
+    generate_ports().await;
 
     HttpServer::new(|| App::new().service(hello).service(allow))
         .bind((config.host.unwrap_or_else(|| "0.0.0.0".into()), port))?

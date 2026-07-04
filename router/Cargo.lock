@@ -1169,6 +1169,7 @@ dependencies = [
  "actix-web",
  "moka",
  "r2d2",
+ "rand",
  "redis",
  "serde",
  "serde_json",
