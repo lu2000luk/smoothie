@@ -104,6 +104,11 @@ async fn route(query: web::Query<RouteQuery>) -> impl Responder {
                 }
                 
                 // TODO: supervisor/initContainer
+                BINDINGS.insert(host.clone(), Bind {
+                    port: solved_port.unwrap_or(0),
+                    host: solved_host.clone().unwrap_or("".to_string()),
+                    last: Instant::now(),
+                });
             } else {
                 return HttpResponse::InternalServerError()
                     .append_header(("X-Error", "No server available"))
