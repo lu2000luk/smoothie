@@ -16,11 +16,12 @@ async fn is_port_free(port: i16) -> bool {
 pub async fn generate_ports() {
     let mut ports = Vec::with_capacity(PREPARE_NEXT_PORTS as usize);
     let mut attempts = 0;
-    let max_attempts = 10000;
+    let max_attempts = 200;
 
     while ports.len() < PREPARE_NEXT_PORTS as usize && attempts < max_attempts {
         let port = rand::random_range(PORT_RANGE_START..=PORT_RANGE_END);
         if is_port_free(port).await {
+            println!("Available Port {}", port);
             ports.push(port);
         }
         attempts += 1;
