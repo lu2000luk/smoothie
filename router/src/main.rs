@@ -4,8 +4,7 @@ mod utils;
 use actix_web::{App, HttpResponse, HttpServer, Responder, get, web};
 use dashmap::DashMap;
 use moka::future::Cache;
-use r2d2::{Pool, PooledConnection};
-use redis::Commands;
+use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use std::{
     sync::{Arc, LazyLock, OnceLock}, time::{Duration, Instant},
@@ -29,7 +28,7 @@ struct Bind {
 static BINDINGS: LazyLock<Arc<DashMap<String, Bind>>> =
     LazyLock::new(|| Arc::new(DashMap::new()));
 
-static REDIS_POOL: OnceLock<Pool<redis::Client>> = OnceLock::new();
+static REDIS_CLIENT: OnceLock<redis::Client> = OnceLock::new();
 
 static SERVERS: OnceLock<Vec<ServerConfig>> = OnceLock::new();
 
@@ -79,13 +78,16 @@ async fn route(query: web::Query<RouteQuery>) -> impl Responder {
     if let Some(bind) = BINDINGS.get(&host) {
         if bind.last.elapsed() < Duration::from_mins(10) {
             already_bound = true;
+            let bind_port = bind.port;
+            let bind_host = bind.host.clone();
+            drop(bind);
             BINDINGS.insert(host.clone(), Bind {
-                port: bind.port,
-                host: bind.host.clone(),
+                port: bind_port,
+                host: bind_host.clone(),
                 last: Instant::now(),
             });
-            solved_host = Some(bind.host.clone());
-            solved_port = Some(bind.port);
+            solved_host = Some(bind_host);
+            solved_port = Some(bind_port);
         } else {
             BINDINGS.remove(&host);
         }
@@ -103,6 +105,9 @@ async fn route(query: web::Query<RouteQuery>) -> impl Responder {
                     // TODO: tunnel/createConnection
                 }
                 
+                let port = ports::consume_port().await.unwrap_or(0);
+                solved_port = Some(port);
+                
                 // TODO: supervisor/initContainer
                 BINDINGS.insert(host.clone(), Bind {
                     port: solved_port.unwrap_or(0),
@@ -119,22 +124,22 @@ async fn route(query: web::Query<RouteQuery>) -> impl Responder {
                 .append_header(("X-Error", "SERVERS not initialized"))
                 .body(now.elapsed().as_nanos().to_string());
         }
-        let port = ports::consume_port().await.unwrap_or(0);
-        solved_port = Some(port);
     }
 
     let solved_host_spawn = solved_host.clone();
     let solved_port_spawn = solved_port.clone();
 
     tokio::spawn(async move {
-        let mut conn: PooledConnection<redis::Client> = match REDIS_POOL.get() {
-            Some(pool) => match pool.get() {
-                Ok(conn) => conn,
-                Err(_) => {
-                    return;
-                }
-            },
+        let client = match REDIS_CLIENT.get() {
+            Some(client) => client,
             None => {
+                return;
+            }
+        };
+
+        let mut conn = match client.get_multiplexed_async_connection().await {
+            Ok(conn) => conn,
+            Err(_) => {
                 return;
             }
         };
@@ -144,14 +149,16 @@ async fn route(query: web::Query<RouteQuery>) -> impl Responder {
             ("scheme", scheme_spawn.as_str()),
             ("ip", ip_spawn.as_str()),
             ("timestamp", timestamp_spawn.as_str()),
-        ]);
+        ]).await;
 
         let _ : redis::RedisResult<String> = conn.xadd("req:".to_owned() + &id_spawn, "router", &[
             ("already_bound", already_bound.to_string().as_str()),
             ("solved_host", solved_host_spawn.as_deref().unwrap_or("")),
             ("solved_port", solved_port_spawn.map(|p| p.to_string()).as_deref().unwrap_or("")),
             ("is_tunnel", is_tunnel.to_string().as_str())
-        ]);
+        ]).await;
+
+        println!("[IN] {}", id_spawn);
     });
 
     if solved_host.is_none() || solved_port.is_none() {
@@ -161,7 +168,7 @@ async fn route(query: web::Query<RouteQuery>) -> impl Responder {
             .body(elapsed.as_nanos().to_string());
     }
 
-    HttpResponse::Ok().body(format!(
+    HttpResponse::Ok().append_header(("X-Time", now.elapsed().as_nanos().to_string())).body(format!(
         "[{{\"dial\":\"{}:{}\"}}]",
         solved_host.unwrap_or_else(|| host.clone()),
         solved_port.unwrap_or(0)
@@ -191,25 +198,27 @@ async fn allow(query: web::Query<AllowQuery>) -> impl Responder {
             .body(elapsed.as_nanos().to_string());
     }
 
-    let mut conn: PooledConnection<redis::Client> = match REDIS_POOL.get() {
-        Some(pool) => match pool.get() {
-            Ok(conn) => conn,
-            Err(_) => {
-                let elapsed = now.elapsed();
-                return HttpResponse::InternalServerError()
-                    .append_header(("X-Error", "Failed to get Redis connection (Err)"))
-                    .body(elapsed.as_nanos().to_string());
-            }
-        },
+    let client = match REDIS_CLIENT.get() {
+        Some(client) => client,
         None => {
             let elapsed = now.elapsed();
             return HttpResponse::InternalServerError()
-                .append_header(("X-Error", "Failed to get Redis connection (None)"))
+                .append_header(("X-Error", "Failed to get Redis client (None)"))
                 .body(elapsed.as_nanos().to_string());
         }
     };
 
-    let resp: redis::RedisResult<String> = conn.get("domains:".to_string() + &query.domain);
+    let mut conn = match client.get_multiplexed_async_connection().await {
+        Ok(conn) => conn,
+        Err(_) => {
+            let elapsed = now.elapsed();
+            return HttpResponse::InternalServerError()
+                .append_header(("X-Error", "Failed to get Redis connection (Err)"))
+                .body(elapsed.as_nanos().to_string());
+        }
+    };
+
+    let resp: redis::RedisResult<String> = conn.get("domains:".to_string() + &query.domain).await;
 
     match resp {
         Ok(value) => {
@@ -282,15 +291,7 @@ async fn main() -> std::io::Result<()> {
             std::process::exit(1);
         }
     };
-
-    let pool = match r2d2::Pool::builder().build(redis_client) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("Failed to create Redis connection pool: {}", e);
-            std::process::exit(1);
-        }
-    };
-    REDIS_POOL.set(pool).expect("Failed to set Redis pool");
+    REDIS_CLIENT.set(redis_client).expect("Failed to set Redis client");
 
     let port = config.port.unwrap_or(8080);
     println!("Starting server: http://localhost:{}", port);
