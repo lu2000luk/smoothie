@@ -256,11 +256,20 @@ struct ServerConfig {
 }
 
 #[derive(Serialize, Deserialize)]
+struct S3Config {
+    access_key: String,
+    secret_key: String,
+    bucket: String,
+    region: String,
+}
+
+#[derive(Serialize, Deserialize)]
 struct Config {
     servers: Vec<ServerConfig>,
     redis: String,
     port: Option<u16>,
     host: Option<String>,
+    s3: S3Config,
 }
 
 #[actix_web::main]
