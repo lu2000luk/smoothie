@@ -1,0 +1,31 @@
+apps:[id]:
+    name: string
+    created_at: datetime
+    owner_id: string
+    build: string (build id)
+    runtime: 0 = alpine (more to come)
+    binding: number | null (port)
+    optimizations: number (int8 -> binary flags) [ mem snapshot | cgroup pause | process sandboxing ] (always enabled: restart & container)
+    [stream] deployment_history string (build id)
+    [stream] logs string (format [datetime]$[level]$[message])
+
+builds:[id]:
+    app_id: string
+    created_at: datetime
+    package: string (id to lookup on s3)
+    args: string
+    aarch: bool (false = arm64, true = x86 [prefer building on arm64])
+    analysis: (bool) (true = package analyzed)
+        size: number (bytes)
+        contents: string (json [ { path, size } ])
+    source: string ("ci" | "cli" | "web")
+    in_use: bool (when packages aren't in use they are compressed)
+
+domains:[domain]: (bool)
+    user_id: string
+    added_at: datetime
+    verified: bool
+    verification_token: string
+    bind: string (app_id)
+
+req:[id]: (stream)
