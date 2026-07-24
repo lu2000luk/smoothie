@@ -20,6 +20,7 @@ builds:[id]:
         contents: string (json [ { path, size } ])
     source: string ("ci" | "cli" | "web")
     in_use: bool (when packages aren't in use they are compressed)
+    hash: string
 
 domains:[domain]: (bool)
     user_id: string
