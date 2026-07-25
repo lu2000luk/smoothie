@@ -1,0 +1,14 @@
+{
+	"s3": {
+		"access_key": "minioadmin",
+		"secret_key": "minioadmin",
+		"bucket": "packages",
+		"region": "us-east-1",
+		"endpoint": "http://localhost:9000",
+		"supports_range": true,
+		"force_path_style": true
+	},
+	"redis": "redis://localhost:6379",
+	"port": 3100,
+	"host": "0.0.0.0"
+}

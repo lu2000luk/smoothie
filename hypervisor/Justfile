@@ -1,0 +1,18 @@
+
+# Console: http://localhost:9001  (minioadmin / minioadmin)
+# API:     http://localhost:9000
+#
+#   "s3": {
+#     "access_key": "minioadmin",
+#     "secret_key": "minioadmin",
+#     "bucket": "packages",
+#     "region": "us-east-1",
+#     "endpoint": "http://localhost:9000",
+#     "supports_range": true,
+#     "force_path_style": true
+#   }
+s3:
+    docker run --rm -p 9000:9000 -p 9001:9001 \
+        -e MINIO_ROOT_USER=minioadmin \
+        -e MINIO_ROOT_PASSWORD=minioadmin \
+        minio/minio server /data --console-address ":9001"
