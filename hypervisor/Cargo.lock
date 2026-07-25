@@ -903,11 +903,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
 
 [[package]]
-name = "crun"
-version = "0.1.0"
+name = "crun-sys"
+version = "0.1.1"
+source = "git+https://github.com/lu2000luk/crun-sys.git#7f959428df107698668bd8f4ed549dae716c6734"
 dependencies = [
  "bindgen",
  "libc",
+ "pkg-config",
 ]
 
 [[package]]
@@ -1606,7 +1608,7 @@ dependencies = [
  "aws-credential-types",
  "aws-sdk-s3",
  "bytes",
- "crun",
+ "crun-sys",
  "filetime",
  "futures",
  "redis",
