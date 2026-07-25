@@ -64,7 +64,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "crun-rs"
+name = "crun"
 version = "0.1.0"
 dependencies = [
  "bindgen",

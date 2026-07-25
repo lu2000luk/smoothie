@@ -1,9 +1,10 @@
+mod container;
 mod globals;
 mod package;
 
 use std::collections::HashMap;
 
-use actix_web::{web, App, HttpServer};
+use actix_web::{App, HttpServer, web};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -57,13 +58,27 @@ struct Config {
 }
 
 mod defaults {
-    pub fn idle_containers() -> u32 { 5 }
-    pub fn max_hybernated_containers() -> u32 { 20 }
-    pub fn snapshots_storage_quota() -> u64 { 209_715_200 }
-    pub fn package_cache_quota() -> u64 { 524_288_000 }
-    pub fn ram() -> u64 { 26_214_400 }
-    pub fn cpu_p() -> u64 { 50_000 }
-    pub fn cpu_q() -> u64 { 12_500 }
+    pub fn idle_containers() -> u32 {
+        5
+    }
+    pub fn max_hybernated_containers() -> u32 {
+        20
+    }
+    pub fn snapshots_storage_quota() -> u64 {
+        209_715_200
+    }
+    pub fn package_cache_quota() -> u64 {
+        524_288_000
+    }
+    pub fn ram() -> u64 {
+        26_214_400
+    }
+    pub fn cpu_p() -> u64 {
+        50_000
+    }
+    pub fn cpu_q() -> u64 {
+        12_500
+    }
 }
 
 #[actix_web::get("/package/prepare/{id}")]
@@ -78,8 +93,9 @@ async fn prepare_package_route(id: web::Path<String>) -> actix_web::HttpResponse
 #[actix_web::get("/package/getlocal/{id}")]
 async fn get_package_route(id: web::Path<String>) -> actix_web::HttpResponse {
     match package::get_package(&id).await {
-        Ok(path) => actix_web::HttpResponse::Ok()
-            .json(serde_json::json!({"path": path.to_string_lossy()})),
+        Ok(path) => {
+            actix_web::HttpResponse::Ok().json(serde_json::json!({"path": path.to_string_lossy()}))
+        }
         Err(e) => actix_web::HttpResponse::InternalServerError()
             .json(serde_json::json!({"error": e.to_string()})),
     }
@@ -135,11 +151,21 @@ async fn main() -> std::io::Result<()> {
 
     let s3_client = aws_sdk_s3::Client::from_conf(s3_builder.build());
 
-    globals::S3_CLIENT.set(s3_client).expect("Failed to set S3 client");
-    globals::S3_BUCKET.set(config.s3.bucket.clone()).expect("Failed to set S3 bucket");
-    globals::CACHE_QUOTA.set(config.package_cache_quota).expect("Failed to set cache quota");
-    globals::SUPPORTS_RANGE.set(config.s3.supports_range.unwrap_or(false)).expect("Failed to set supports_range");
-    globals::DOWNLOAD_LOCKS.set(Mutex::new(HashMap::new())).expect("Failed to set download locks");
+    globals::S3_CLIENT
+        .set(s3_client)
+        .expect("Failed to set S3 client");
+    globals::S3_BUCKET
+        .set(config.s3.bucket.clone())
+        .expect("Failed to set S3 bucket");
+    globals::CACHE_QUOTA
+        .set(config.package_cache_quota)
+        .expect("Failed to set cache quota");
+    globals::SUPPORTS_RANGE
+        .set(config.s3.supports_range.unwrap_or(false))
+        .expect("Failed to set supports_range");
+    globals::DOWNLOAD_LOCKS
+        .set(Mutex::new(HashMap::new()))
+        .expect("Failed to set download locks");
 
     package::ensure_dirs();
     package::cleanup_stale_temps();
@@ -152,7 +178,7 @@ async fn main() -> std::io::Result<()> {
             .service(prepare_package_route)
             .service(get_package_route)
     })
-        .bind((config.host.unwrap_or_else(|| "0.0.0.0".into()), port))?
-        .run()
-        .await
+    .bind((config.host.unwrap_or_else(|| "0.0.0.0".into()), port))?
+    .run()
+    .await
 }
