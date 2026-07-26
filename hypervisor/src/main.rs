@@ -1,10 +1,12 @@
 mod container;
 mod globals;
 mod image;
+#[cfg(unix)]
+mod log;
 mod package;
 mod port;
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use actix_web::{App, HttpServer, web};
 use serde::{Deserialize, Serialize};
@@ -399,8 +401,16 @@ async fn main() -> std::io::Result<()> {
 
     let runtime_root = data_root.join("runtime");
     let idle_root = data_root.join("containers").join("idle");
+    #[cfg(unix)]
+    let sockets_dir = PathBuf::from("/tmp/smoothie/sock");
+    #[cfg(not(unix))]
+    let sockets_dir = data_root.join("sock");
     std::fs::create_dir_all(&runtime_root)?;
     std::fs::create_dir_all(&idle_root)?;
+    std::fs::create_dir_all(&sockets_dir)?;
+    globals::SOCKETS_DIR
+        .set(sockets_dir)
+        .expect("Failed to set sockets directory");
     globals::RUNTIME
         .set(container::CrunRuntime::new(runtime_root))
         .expect("Failed to initialize container runtime");
