@@ -44,7 +44,7 @@ pub fn reserve_free_port_in_range(start: u16, end: u16) -> io::Result<PortReserv
 
     for offset in 0..range_len {
         let port = start + ((first_offset + offset) % range_len) as u16;
-        match TcpListener::bind(("127.0.0.1", port)) {
+        match TcpListener::bind(("0.0.0.0", port)) {
             Ok(listener) => return Ok(PortReservation { listener }),
             Err(error) if error.kind() == io::ErrorKind::AddrInUse => continue,
             Err(error) => return Err(error),

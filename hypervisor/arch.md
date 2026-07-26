@@ -11,6 +11,14 @@ process: run all processes inside the same container but each process with cgrou
 package format: (since we have multiple run modes the apps are packaged in an universal way) (stored in S3, store in LRU disk cache)
 .tar file: - main (entrypoint) - ... (any other files, will be injected together with the entrypoint)
 
+container API:
+- `select_tarball(path)` validates the selected `.tar` file.
+- `inject(tarball, argv)` expands it into an idle container.
+- `run(injected, container_port)` starts it and publishes a host port chosen by `port.rs`.
+- `kill(running)` stops the container, removes its crun state, and closes its published port.
+
+Published ports use a retained host TCP listener and relay to `127.0.0.1:container_port`. This gives Docker-style `HOST_PORT:CONTAINER_PORT` behaviour: the host port is selected and reserved by Smoothie, while an application can listen on any distinct container port. The current crun networking implementation uses the host network namespace so the relay can reach the application; a future isolated namespace backend must preserve this API and route the relay to that namespace instead.
+
 hypervisor only stuff:
 always run 1/2 parent containers (all containers with crun!), one for x86, the other for arm (auto detect the system's aarch and choose the one to emulate)
 run everything else inside: - 1 unlimited container for the process run mode - X idle containers ready to get injected - X running containers - X hybernated containers

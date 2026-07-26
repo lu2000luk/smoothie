@@ -29,4 +29,6 @@ domains:[domain]: (bool)
     verification_token: string
     bind: string (app_id)
 
-req:[id]: (stream)
+req:[id]: (stream any)
+
+logs:[container id] (stream string)

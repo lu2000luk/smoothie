@@ -13,4 +13,4 @@ pub static SUPPORTS_RANGE: OnceLock<bool> = OnceLock::new();
 pub static DOWNLOAD_LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     OnceLock::new();
 pub static RUNTIME: OnceLock<CrunRuntime> = OnceLock::new();
-pub static IDLE_CONTAINERS: OnceLock<IdleContainerPool> = OnceLock::new();
+pub static IDLE_CONTAINERS: OnceLock<Arc<IdleContainerPool>> = OnceLock::new();

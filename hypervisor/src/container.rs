@@ -2,10 +2,13 @@ use std::{
     collections::{BTreeMap, VecDeque},
     ffi::CString,
     fmt,
+    io,
+    net::SocketAddr,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
-use tokio::sync::Mutex;
+use tokio::{io::copy_bidirectional, net::{TcpListener, TcpStream}, sync::Mutex, task::JoinHandle};
 
 use crun_sys::{
     crun_error_release, libcrun_container_delete, libcrun_container_free, libcrun_container_kill,
@@ -29,6 +32,7 @@ pub enum ContainerError {
     Oci(String),
     Package(String),
     Image(String),
+    Io(io::Error),
     IdlePoolExhausted,
     Crun { operation: &'static str, code: i32 },
 }
@@ -48,6 +52,7 @@ impl fmt::Display for ContainerError {
             Self::Oci(err) => write!(f, "failed to write OCI config: {err}")?,
             Self::Package(err) => write!(f, "failed to load package: {err}")?,
             Self::Image(err) => write!(f, "failed to prepare Alpine image: {err}")?,
+            Self::Io(err) => write!(f, "network I/O failed: {err}")?,
             Self::IdlePoolExhausted => write!(f, "no idle containers are available")?,
             Self::Crun { operation, code } => {
                 write!(f, "libcrun {operation} failed with status {code}")?
@@ -58,6 +63,10 @@ impl fmt::Display for ContainerError {
 }
 
 impl std::error::Error for ContainerError {}
+
+impl From<io::Error> for ContainerError {
+    fn from(error: io::Error) -> Self { Self::Io(error) }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ResourceLimits {
@@ -174,6 +183,119 @@ pub struct IdleContainerPool {
     base_archive: PathBuf,
 }
 
+#[derive(Debug)]
+pub struct PortMapping {
+    host_port: u16,
+    container_port: u16,
+    relay: JoinHandle<()>,
+}
+
+impl PortMapping {
+    pub async fn publish(container_port: u16) -> Result<Self> {
+        let reservation = crate::port::reserve_free_port().map_err(ContainerError::Io)?;
+        let host_port = reservation.port();
+        let listener = reservation.into_listener();
+        listener.set_nonblocking(true)?;
+        let listener = TcpListener::from_std(listener)?;
+        let target = SocketAddr::from(([127, 0, 0, 1], container_port));
+        let relay = tokio::spawn(async move {
+            loop {
+                let Ok((mut inbound, _)) = listener.accept().await else { break };
+                let target = target;
+                tokio::spawn(async move {
+                    let Ok(mut outbound) = async {
+                        for _ in 0..30 {
+                            match TcpStream::connect(target).await {
+                                Ok(stream) => return Ok(stream),
+                                Err(_) => {
+                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                }
+                            }
+                        }
+                        Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "target not ready after retries"))
+                    }.await else { return };
+                    let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
+                });
+            }
+        });
+        Ok(Self { host_port, container_port, relay })
+    }
+
+    pub fn host_port(&self) -> u16 { self.host_port }
+    pub fn container_port(&self) -> u16 { self.container_port }
+}
+
+impl Drop for PortMapping {
+    fn drop(&mut self) { self.relay.abort(); }
+}
+
+#[derive(Clone)]
+pub struct ContainerApi {
+    runtime: CrunRuntime,
+    idle: Arc<IdleContainerPool>,
+}
+
+pub struct SelectedTarball(PathBuf);
+
+pub struct InjectedContainer(ContainerRequest);
+
+impl InjectedContainer {
+    pub fn id(&self) -> &str { &self.0.id }
+    pub fn package_tarball(&self) -> Option<&Path> { self.0.package_tarball.as_deref() }
+}
+
+pub struct RunningContainer {
+    definition: ContainerDefinition,
+    port: PortMapping,
+    task: JoinHandle<Result<()>>,
+}
+
+impl RunningContainer {
+    pub fn id(&self) -> &str { &self.definition.id }
+    pub fn host_port(&self) -> u16 { self.port.host_port() }
+    pub fn container_port(&self) -> u16 { self.port.container_port() }
+    pub async fn wait(self) -> Result<()> { self.task.await.map_err(|e| ContainerError::Image(e.to_string()))? }
+}
+
+impl ContainerApi {
+    pub fn new(runtime: CrunRuntime, idle: Arc<IdleContainerPool>) -> Self { Self { runtime, idle } }
+
+    pub async fn select_tarball(&self, path: impl Into<PathBuf>) -> Result<SelectedTarball> {
+        let path = path.into();
+        let metadata = tokio::fs::metadata(&path).await.map_err(|e| ContainerError::Package(e.to_string()))?;
+        if !metadata.is_file() { return Err(ContainerError::Package("tarball path is not a file".into())); }
+        Ok(SelectedTarball(path))
+    }
+
+    pub async fn inject(&self, tarball: SelectedTarball, argv: Vec<String>) -> Result<InjectedContainer> {
+        let slot = self.idle.available.lock().await.pop_front().ok_or(ContainerError::IdlePoolExhausted)?;
+        if let Err(error) = unpack(&tarball.0, &slot.rootfs, false).await {
+            self.idle.available.lock().await.push_front(slot);
+            return Err(error);
+        }
+        let mut request = ContainerRequest::new(slot.id, slot.bundle, slot.rootfs, argv);
+        request.network = NetworkMode::Host;
+        request.package_tarball = Some(tarball.0);
+        Ok(InjectedContainer(request))
+    }
+
+    pub async fn run(&self, injected: InjectedContainer, container_port: u16) -> Result<RunningContainer> {
+        let port = PortMapping::publish(container_port).await?;
+        let definition = self.runtime.prepare(injected.0)?;
+        let runtime = self.runtime.clone();
+        let run_definition = definition.clone();
+        let task = tokio::task::spawn_blocking(move || runtime.run(&run_definition));
+        Ok(RunningContainer { definition, port, task })
+    }
+
+    pub fn kill(&self, running: RunningContainer) -> Result<()> {
+        let RunningContainer { definition, port: _, task } = running;
+        task.abort();
+        let _ = self.runtime.kill(&definition.id, "SIGKILL");
+        self.runtime.delete(&definition, true)
+    }
+}
+
 impl IdleContainerPool {
     pub async fn new(
         root: impl Into<PathBuf>,
@@ -239,6 +361,10 @@ impl IdleContainerPool {
         if unpack(&self.base_archive, &slot.rootfs, true).await.is_ok() {
             self.available.lock().await.push_back(slot);
         }
+    }
+
+    pub async fn list_ids(&self) -> Vec<String> {
+        self.available.lock().await.iter().map(|c| c.id.clone()).collect()
     }
 
     pub async fn available(&self) -> usize {
@@ -399,7 +525,8 @@ impl CrunRuntime {
             let mut err: libcrun_error_t = std::ptr::null_mut();
             let container = libcrun_container_load_from_memory(json.as_ptr(), &mut err);
             if container.is_null() {
-                return Err(crun_error("load for delete", -1, &mut err));
+                release_error(&mut err);
+                return self.cleanup_state(&definition.id);
             }
             let mut ctx: libcrun_context_s = std::mem::zeroed();
             ctx.state_root = state_root.as_ptr();
@@ -412,9 +539,19 @@ impl CrunRuntime {
             );
             libcrun_container_free(container);
             if status != 0 {
-                return Err(crun_error("delete", status, &mut err));
+                release_error(&mut err);
+                return self.cleanup_state(&definition.id);
             }
             release_error(&mut err);
+        }
+        Ok(())
+    }
+
+    fn cleanup_state(&self, id: &str) -> Result<()> {
+        let state_dir = self.state_root.join(id);
+        if state_dir.exists() {
+            std::fs::remove_dir_all(&state_dir)
+                .map_err(|e| ContainerError::Io(e))?;
         }
         Ok(())
     }
@@ -534,6 +671,7 @@ fn release_error(err: &mut libcrun_error_t) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     #[test]
     fn request_generates_cgroup_and_network_oci() {
         let mut request = ContainerRequest::new(
@@ -558,5 +696,27 @@ mod tests {
                 .iter()
                 .any(|v| v["type"] == "network")
         );
+    }
+
+    #[tokio::test]
+    async fn published_host_port_relays_to_a_different_container_port() {
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = target_listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = target_listener.accept().await.unwrap();
+            let mut request = [0; 4];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"ping");
+            stream.write_all(b"pong").await.unwrap();
+        });
+
+        let mapping = PortMapping::publish(target_port).await.unwrap();
+        assert_ne!(mapping.host_port(), mapping.container_port());
+        let mut client = TcpStream::connect(("127.0.0.1", mapping.host_port())).await.unwrap();
+        client.write_all(b"ping").await.unwrap();
+        let mut response = [0; 4];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"pong");
+        server.await.unwrap();
     }
 }
