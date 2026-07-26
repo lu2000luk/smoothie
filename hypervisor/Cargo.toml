@@ -16,3 +16,4 @@ futures = "0.3"
 filetime = "0.2"
 bytes = "1"
 crun-sys = { git = "https://github.com/lu2000luk/crun-sys.git" }
+oci-spec = "0.10.0"

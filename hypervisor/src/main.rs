@@ -1,6 +1,8 @@
 mod container;
 mod globals;
+mod image;
 mod package;
+mod port;
 
 use std::collections::HashMap;
 
@@ -169,6 +171,29 @@ async fn main() -> std::io::Result<()> {
 
     package::ensure_dirs();
     package::cleanup_stale_temps();
+
+    let alpine_archive = image::ensure_alpine()
+        .await
+        .map_err(std::io::Error::other)?;
+    let data_root = alpine_archive
+        .parent()
+        .expect("Alpine archive has no parent")
+        .parent()
+        .expect("images directory has no parent");
+    let runtime_root = data_root.join("runtime");
+    let idle_root = data_root.join("containers").join("idle");
+    std::fs::create_dir_all(&runtime_root)?;
+    std::fs::create_dir_all(&idle_root)?;
+    globals::RUNTIME
+        .set(container::CrunRuntime::new(runtime_root))
+        .expect("Failed to initialize container runtime");
+    globals::IDLE_CONTAINERS
+        .set(
+            container::IdleContainerPool::new(idle_root, alpine_archive, config.idle_containers)
+                .await
+                .map_err(std::io::Error::other)?,
+        )
+        .expect("Failed to initialize idle containers");
 
     let port = config.port.unwrap_or(8080);
     println!("Starting server: http://localhost:{}", port);
