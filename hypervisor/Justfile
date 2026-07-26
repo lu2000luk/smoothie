@@ -16,3 +16,12 @@ s3:
         -e MINIO_ROOT_USER=minioadmin \
         -e MINIO_ROOT_PASSWORD=minioadmin \
         minio/minio server /data --console-address ":9001"
+
+config-crun:
+    git clone https://github.com/containers/crun.git
+    cd crun && ./autogen.sh
+    cd crun && ./configure --enable-shared
+    cd crun && make
+    cd crun && sudo make install
+    cd crun && sudo ldconfig
+#    rm -rf crun

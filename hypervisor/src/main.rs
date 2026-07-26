@@ -391,20 +391,23 @@ async fn main() -> std::io::Result<()> {
     let alpine_archive = image::ensure_alpine()
         .await
         .map_err(std::io::Error::other)?;
-    let data_root = alpine_archive
+
+    println!("Preparing base rootfs...");
+
+    let base_rootfs = tokio::task::spawn_blocking(move || image::ensure_base_rootfs(&alpine_archive))
+        .await
+        .map_err(std::io::Error::other)?
+        .map_err(std::io::Error::other)?;
+
+    let data_root = base_rootfs
         .parent()
-        .expect("Alpine archive has no parent")
-        .parent()
-        .expect("images directory has no parent");
+        .expect("base rootfs has no parent");
 
     println!("Initializing container runtime...");
 
     let runtime_root = data_root.join("runtime");
     let idle_root = data_root.join("containers").join("idle");
-    #[cfg(unix)]
     let sockets_dir = PathBuf::from("/tmp/smoothie/sock");
-    #[cfg(not(unix))]
-    let sockets_dir = data_root.join("sock");
     std::fs::create_dir_all(&runtime_root)?;
     std::fs::create_dir_all(&idle_root)?;
     std::fs::create_dir_all(&sockets_dir)?;
@@ -419,7 +422,7 @@ async fn main() -> std::io::Result<()> {
 
     globals::IDLE_CONTAINERS
         .set(Arc::new(
-            container::IdleContainerPool::new(idle_root, alpine_archive, config.idle_containers)
+            container::IdleContainerPool::new(idle_root, base_rootfs, config.idle_containers)
                 .await
                 .map_err(std::io::Error::other)?,
         ))

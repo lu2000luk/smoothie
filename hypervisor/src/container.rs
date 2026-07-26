@@ -7,6 +7,9 @@ use std::{
     sync::Arc,
 };
 
+use flate2::read::GzDecoder;
+use tar::Archive;
+
 use uuid::Uuid;
 
 use tokio::{
@@ -183,12 +186,14 @@ pub struct IdleContainer {
     pub id: String,
     pub bundle: PathBuf,
     pub rootfs: PathBuf,
+    pub upper: PathBuf,
+    pub work: PathBuf,
 }
 
 #[derive(Debug)]
 pub struct IdleContainerPool {
     available: Mutex<VecDeque<IdleContainer>>,
-    base_archive: PathBuf,
+    base_rootfs: PathBuf,
 }
 
 #[derive(Debug)]
@@ -227,8 +232,7 @@ impl PortMapping {
                             match TcpStream::connect(target).await {
                                 Ok(stream) => return Ok(stream),
                                 Err(_) => {
-                                    tokio::time::sleep(std::time::Duration::from_millis(100))
-                                        .await;
+                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                                 }
                             }
                         }
@@ -324,10 +328,7 @@ impl ContainerApi {
         if !metadata.is_file() {
             return Err(ContainerError::Package("tarball path is not a file".into()));
         }
-        eprintln!(
-            "[container] select_tarball: ok size={}",
-            metadata.len()
-        );
+        eprintln!("[container] select_tarball: ok size={}", metadata.len());
         Ok(SelectedTarball(path))
     }
 
@@ -349,15 +350,18 @@ impl ContainerApi {
             .pop_front()
             .ok_or(ContainerError::IdlePoolExhausted)?;
         eprintln!(
-            "[container] inject: got idle slot id={} unpacking...",
+            "[container] inject: got idle slot id={} extracting package into upper layer...",
             slot.id
         );
-        if let Err(error) = unpack(&tarball.0, &slot.rootfs, false).await {
-            eprintln!("[container] inject: id={} unpack failed: {}", slot.id, error);
+        if let Err(error) = extract_tar(&tarball.0, &slot.upper, false).await {
+            eprintln!(
+                "[container] inject: id={} extract failed: {}",
+                slot.id, error
+            );
             self.idle.available.lock().await.push_front(slot);
             return Err(error);
         }
-        eprintln!("[container] inject: id={} unpack done", slot.id);
+        eprintln!("[container] inject: id={} extract done", slot.id);
         let mut request = ContainerRequest::new(slot.id, slot.bundle, slot.rootfs, argv);
         request.network = NetworkMode::Host;
         request.package_tarball = Some(tarball.0);
@@ -387,7 +391,10 @@ impl ContainerApi {
             let f = crate::log::LogForwarder::start(definition.id.clone(), &definition.bundle)
                 .await
                 .map_err(ContainerError::Io)?;
-            eprintln!("[container] run: id={} log forwarder started", definition.id);
+            eprintln!(
+                "[container] run: id={} log forwarder started",
+                definition.id
+            );
             f
         };
 
@@ -396,8 +403,7 @@ impl ContainerApi {
         let task = tokio::task::spawn_blocking(move || {
             #[cfg(unix)]
             {
-                let console_socket_path =
-                    crate::globals::console_socket_path(&run_definition.id);
+                let console_socket_path = crate::globals::console_socket_path(&run_definition.id);
                 eprintln!(
                     "[container] run: id={} starting crun with socket={}",
                     run_definition.id,
@@ -444,7 +450,10 @@ impl ContainerApi {
         eprintln!("[container] kill: id={} deleting container", definition.id);
         let result = self.runtime.delete(&definition, true);
         if let Err(ref e) = result {
-            eprintln!("[container] kill: id={} delete failed: {}", definition.id, e);
+            eprintln!(
+                "[container] kill: id={} delete failed: {}",
+                definition.id, e
+            );
         } else {
             eprintln!("[container] kill: id={} done", definition.id);
         }
@@ -455,26 +464,41 @@ impl ContainerApi {
 impl IdleContainerPool {
     pub async fn new(
         root: impl Into<PathBuf>,
-        base_archive: impl Into<PathBuf>,
+        base_rootfs: impl Into<PathBuf>,
         count: u32,
     ) -> Result<Self> {
         let root = root.into();
-        let base_archive = base_archive.into();
+        let base_rootfs = base_rootfs.into();
         let mut available = VecDeque::with_capacity(count as usize);
         for x in 0..count {
             eprintln!("[idle-pool] preparing container {x}/{count}...");
             let id = Uuid::new_v4().to_string();
+            let slot_root = root.join(&id);
+            let upper = slot_root.join("upper");
+            let work = slot_root.join("work");
+            let rootfs = slot_root.join("rootfs");
+            tokio::fs::create_dir_all(&upper)
+                .await
+                .map_err(|e| ContainerError::Image(e.to_string()))?;
+            tokio::fs::create_dir_all(&work)
+                .await
+                .map_err(|e| ContainerError::Image(e.to_string()))?;
+            tokio::fs::create_dir_all(&rootfs)
+                .await
+                .map_err(|e| ContainerError::Image(e.to_string()))?;
+            mount_overlay(&base_rootfs, &upper, &work, &rootfs)?;
             let slot = IdleContainer {
                 id: id.clone(),
                 bundle: root.join(&id),
-                rootfs: root.join(&id).join("rootfs"),
+                rootfs,
+                upper,
+                work,
             };
-            unpack(&base_archive, &slot.rootfs, true).await?;
             available.push_back(slot);
         }
         Ok(Self {
             available: Mutex::new(available),
-            base_archive,
+            base_rootfs,
         })
     }
 
@@ -492,7 +516,7 @@ impl IdleContainerPool {
             .await
             .pop_front()
             .ok_or(ContainerError::IdlePoolExhausted)?;
-        if let Err(error) = unpack(&package_tarball, &slot.rootfs, false).await {
+        if let Err(error) = extract_tar(&package_tarball, &slot.upper, false).await {
             self.available.lock().await.push_front(slot);
             return Err(error);
         }
@@ -513,12 +537,22 @@ impl IdleContainerPool {
     pub async fn release(&self, request: ContainerRequest) {
         let slot = IdleContainer {
             id: request.id,
-            bundle: request.bundle,
+            bundle: request.bundle.clone(),
             rootfs: request.rootfs,
+            upper: request.bundle.join("upper"),
+            work: request.bundle.join("work"),
         };
-        if unpack(&self.base_archive, &slot.rootfs, true).await.is_ok() {
-            self.available.lock().await.push_back(slot);
+        let _ = umount_overlay(&slot.rootfs);
+        let _ = tokio::fs::remove_dir_all(&slot.upper).await;
+        let _ = tokio::fs::remove_dir_all(&slot.work).await;
+        if tokio::fs::create_dir_all(&slot.upper).await.is_err()
+            || tokio::fs::create_dir_all(&slot.work).await.is_err()
+            || tokio::fs::create_dir_all(&slot.rootfs).await.is_err()
+            || mount_overlay(&self.base_rootfs, &slot.upper, &slot.work, &slot.rootfs).is_err()
+        {
+            return;
         }
+        self.available.lock().await.push_back(slot);
     }
 
     pub async fn list_ids(&self) -> Vec<String> {
@@ -535,33 +569,94 @@ impl IdleContainerPool {
     }
 }
 
-async fn unpack(archive: &Path, rootfs: &Path, gzip: bool) -> Result<()> {
+async fn extract_tar(archive: &Path, dest: &Path, _gzip: bool) -> Result<()> {
     eprintln!(
-        "[container] unpack: archive={} rootfs={} gzip={gzip}",
+        "[container] extract_tar: archive={} dest={}",
         archive.display(),
-        rootfs.display()
+        dest.display()
     );
-    if rootfs.exists() {
-        tokio::fs::remove_dir_all(rootfs)
-            .await
-            .map_err(|error| ContainerError::Image(error.to_string()))?;
-    }
-    tokio::fs::create_dir_all(rootfs)
-        .await
-        .map_err(|error| ContainerError::Image(error.to_string()))?;
-    let status = tokio::process::Command::new("tar")
-        .arg(if gzip { "-xzf" } else { "-xf" })
-        .arg(archive)
-        .arg("-C")
-        .arg(rootfs)
-        .status()
-        .await
-        .map_err(|error| ContainerError::Image(error.to_string()))?;
-    if status.success() {
+    let archive = archive.to_path_buf();
+    let dest = dest.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open(&archive)
+            .map_err(|e| ContainerError::Image(format!("failed to open archive: {e}")))?;
+        if archive.extension().and_then(|e| e.to_str()) == Some("gz") {
+            let gz = GzDecoder::new(file);
+            let mut ar = Archive::new(gz);
+            ar.unpack(&dest)
+                .map_err(|e| ContainerError::Image(format!("tar extract failed: {e}")))?;
+        } else {
+            let mut ar = Archive::new(file);
+            ar.unpack(&dest)
+                .map_err(|e| ContainerError::Image(format!("tar extract failed: {e}")))?;
+        }
         Ok(())
-    } else {
-        Err(ContainerError::Image(format!("tar exited with {status}")))
+    })
+    .await
+    .map_err(|e| ContainerError::Image(e.to_string()))?
+}
+
+#[cfg(unix)]
+fn mount_overlay(lower: &Path, upper: &Path, work: &Path, merged: &Path) -> Result<()> {
+    eprintln!(
+        "[container] overlayfs: lower={} upper={} work={} merged={}",
+        lower.display(),
+        upper.display(),
+        work.display(),
+        merged.display()
+    );
+    let opts = format!(
+        "lowerdir={},upperdir={},workdir={}",
+        lower.display(),
+        upper.display(),
+        work.display()
+    );
+    let c_opts = CString::new(opts).map_err(|_| ContainerError::InteriorNul("overlayfs opts"))?;
+    let c_merged = cstring_path(merged, "overlayfs merged")?;
+    let c_type =
+        CString::new("overlay").map_err(|_| ContainerError::InteriorNul("overlayfs type"))?;
+    let ret = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            c_merged.as_ptr().cast(),
+            c_type.as_ptr().cast(),
+            0,
+            c_opts.as_ptr().cast(),
+        )
+    };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(ContainerError::Image(format!(
+            "overlayfs mount failed: {err}"
+        )));
     }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn mount_overlay(_lower: &Path, _upper: &Path, _work: &Path, _merged: &Path) -> Result<()> {
+    Err(ContainerError::Image(
+        "overlayfs is only supported on Linux".into(),
+    ))
+}
+
+#[cfg(unix)]
+fn umount_overlay(merged: &Path) -> Result<()> {
+    eprintln!("[container] umount: merged={}", merged.display());
+    let c_merged = cstring_path(merged, "umount path")?;
+    let ret = unsafe { libc::umount2(c_merged.as_ptr(), libc::MNT_DETACH) };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(ContainerError::Image(format!("umount failed: {err}")));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn umount_overlay(_merged: &Path) -> Result<()> {
+    Err(ContainerError::Image(
+        "umount is only supported on Linux".into(),
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -622,6 +717,7 @@ impl CrunRuntime {
         apply_network(&mut linux, &request.network);
 
         let mut spec = Spec::default();
+        spec.set_version("1.0.2".into());
         spec.set_root(Some(Root::default()));
         spec.root_mut()
             .as_mut()
@@ -671,7 +767,10 @@ impl CrunRuntime {
             let mut err: libcrun_error_t = std::ptr::null_mut();
             let container = libcrun_container_load_from_memory(json.as_ptr(), &mut err);
             if container.is_null() {
-                eprintln!("[container] crun: run id={} load_from_memory failed", definition.id);
+                eprintln!(
+                    "[container] crun: run id={} load_from_memory failed",
+                    definition.id
+                );
                 return Err(crun_error("load", -1, &mut err));
             }
             let mut ctx: libcrun_context_s = std::mem::zeroed();
@@ -681,11 +780,17 @@ impl CrunRuntime {
             if let Some(ref cs) = console_socket_cstr {
                 ctx.console_socket = cs.as_ptr();
             }
-            eprintln!("[container] crun: run id={} calling libcrun_container_run", definition.id);
+            eprintln!(
+                "[container] crun: run id={} calling libcrun_container_run",
+                definition.id
+            );
             let status = libcrun_container_run(&mut ctx, container, 0, &mut err);
             libcrun_container_free(container);
             if status != 0 {
-                eprintln!("[container] crun: run id={} failed with status {status}", definition.id);
+                eprintln!(
+                    "[container] crun: run id={} failed with status {status}",
+                    definition.id
+                );
                 return Err(crun_error("run", status, &mut err));
             }
             eprintln!("[container] crun: run id={} exited cleanly", definition.id);
@@ -713,7 +818,10 @@ impl CrunRuntime {
     }
 
     pub fn delete(&self, definition: &ContainerDefinition, force: bool) -> Result<()> {
-        eprintln!("[container] crun: delete id={} force={force}", definition.id);
+        eprintln!(
+            "[container] crun: delete id={} force={force}",
+            definition.id
+        );
         let json = definition.oci_json()?;
         let json = CString::new(json).map_err(|_| ContainerError::InteriorNul("OCI JSON"))?;
         let id = cstring(&definition.id, "container id")?;
@@ -853,9 +961,41 @@ fn cstring_path(value: &Path, field: &'static str) -> Result<CString> {
     )
 }
 fn crun_error(operation: &'static str, code: i32, err: &mut libcrun_error_t) -> ContainerError {
+    let (status, msg) = extract_crun_error(err);
+    eprintln!("[container] crun: {operation} failed: status={status} msg={msg}");
     release_error(err);
     ContainerError::Crun { operation, code }
 }
+
+#[repr(C)]
+struct CrunError {
+    status: std::os::raw::c_int,
+    msg: *mut std::os::raw::c_char,
+}
+
+fn extract_crun_error(err: &mut libcrun_error_t) -> (i32, String) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        use std::ffi::CStr;
+        if err.is_null() {
+            return (-1, "<no error struct>".into());
+        }
+        let raw = (*err) as *mut CrunError;
+        let status = (*raw).status;
+        let msg = if (*raw).msg.is_null() {
+            "<no message>".into()
+        } else {
+            CStr::from_ptr((*raw).msg).to_string_lossy().into_owned()
+        };
+        (status, msg)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = err;
+        (-1, "<crun not available on this platform>".into())
+    }
+}
+
 fn release_error(err: &mut libcrun_error_t) {
     unsafe {
         if !err.is_null() {

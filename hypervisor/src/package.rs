@@ -1,5 +1,6 @@
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
+use std::println;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -30,19 +31,30 @@ fn tmp_path(id: &str) -> PathBuf {
 }
 
 pub fn ensure_dirs() {
-    std::fs::create_dir_all(cache_dir()).expect("failed to create package cache directory");
+    let dir = cache_dir();
+    println!("Package Cache: {dir:?}");
+
+    let mut check = dir.as_path();
+    let mut to_remove = Vec::new();
+    while let Some(parent) = check.parent() {
+        if check.exists() && !check.is_dir() {
+            to_remove.push(check.to_path_buf());
+        }
+        check = parent;
+    }
+    for p in to_remove {
+        eprintln!("removing file blocking path: {p:?}");
+        std::fs::remove_file(&p).expect("failed to remove file blocking directory path");
+    }
+
+    std::fs::create_dir_all(&dir).expect("failed to create package cache directory");
 }
 
 pub fn cleanup_stale_temps() {
     let dir = cache_dir();
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for entry in entries.flatten() {
-            if entry
-                .path()
-                .extension()
-                .and_then(|e| e.to_str())
-                == Some("tmp")
-            {
+            if entry.path().extension().and_then(|e| e.to_str()) == Some("tmp") {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
@@ -58,7 +70,9 @@ pub async fn prepare_package(id: &str) -> PkgResult<()> {
     }
 
     let lock = {
-        let locks = globals::DOWNLOAD_LOCKS.get().expect("globals not initialised");
+        let locks = globals::DOWNLOAD_LOCKS
+            .get()
+            .expect("globals not initialised");
         let mut map = locks.lock().await;
         map.entry(id.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
@@ -102,7 +116,9 @@ async fn download(id: &str) -> PkgResult<()> {
 async fn download_inner(id: &str, tmp: &Path) -> PkgResult<()> {
     let client = globals::S3_CLIENT.get().expect("S3_CLIENT not set");
     let bucket = globals::S3_BUCKET.get().expect("S3_BUCKET not set");
-    let supports_range = *globals::SUPPORTS_RANGE.get().expect("SUPPORTS_RANGE not set");
+    let supports_range = *globals::SUPPORTS_RANGE
+        .get()
+        .expect("SUPPORTS_RANGE not set");
 
     let key = format!("{id}.tar");
 
