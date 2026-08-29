@@ -1,40 +1,33 @@
-use std::io;
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use nix::fcntl::{fcntl, FcntlArg, OFlag};
-use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags, UnixAddr};
-use tokio::io::unix::AsyncFd;
+use futures::StreamExt;
 use tokio::task::JoinHandle;
 
+use crate::docker::{LogFrame, LogStream};
 use crate::globals;
 
 pub struct LogForwarder {
     task: JoinHandle<()>,
-    socket_path: PathBuf,
+    container_id: String,
 }
 
 impl LogForwarder {
-    pub async fn start(container_id: String, _bundle: &Path) -> Result<Self, io::Error> {
-        let socket_path = crate::globals::console_socket_path(&container_id);
-        if let Some(parent) = socket_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::remove_file(&socket_path);
+    /// Subscribe to the container's logs through the Docker daemon and forward
+    /// each decoded frame into the per-container Redis stream.
+    pub async fn start(container_id: String) -> std::io::Result<Self> {
         eprintln!("[log] starting log forwarder for {container_id}");
-
-        let listener = std::os::unix::net::UnixListener::bind(&socket_path)?;
-        listener.set_nonblocking(true)?;
-
+        let runtime = globals::DOCKER_RUNTIME
+            .get()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "docker runtime not set"))?
+            .clone();
         let id = container_id.clone();
         let task = tokio::spawn(async move {
-            if let Err(e) = forward_logs(listener, id.clone()).await {
-                eprintln!("log forwarder error for {}: {}", id, e);
-            }
+            forward_logs(runtime, id).await;
         });
-
-        Ok(Self { task, socket_path })
+        Ok(Self {
+            task,
+            container_id,
+        })
     }
 
     pub fn abort(&self) {
@@ -45,147 +38,104 @@ impl LogForwarder {
 impl Drop for LogForwarder {
     fn drop(&mut self) {
         self.task.abort();
-        let _ = std::fs::remove_file(&self.socket_path);
     }
 }
 
-async fn forward_logs(
-    listener: std::os::unix::net::UnixListener,
-    container_id: String,
-) -> Result<(), io::Error> {
-    let async_listener = AsyncFd::new(listener)?;
-
-    let stream = tokio::time::timeout(Duration::from_secs(30), accept_connection(&async_listener))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "timeout waiting for console"))?
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-    let master_fd = receive_fd(stream)?;
-
-    fcntl(master_fd.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-    let async_fd = AsyncFd::new(master_fd)?;
-
-    let client = globals::REDIS_CLIENT
-        .get()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Redis client not set"))?;
-    let mut conn = client
-        .get_multiplexed_async_connection()
-        .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-    let mut buf = [0u8; 4096];
-    let mut line_buf = String::new();
-
-    loop {
-        let n = read_pty(&async_fd, &mut buf).await?;
-        if n == 0 {
-            break;
+async fn forward_logs(runtime: std::sync::Arc<crate::docker::DockerRuntime>, container_id: String) {
+    // Give Docker a moment to attach to the container's logs. Repeatedly retry
+    // because the log endpoint can race the container's start.
+    let mut stream = match connect_logs(&runtime, &container_id).await {
+        Ok(stream) => stream,
+        Err(err) => {
+            eprintln!("log forwarder connect failed for {container_id}: {err}");
+            return;
         }
+    };
 
-        line_buf.push_str(&String::from_utf8_lossy(&buf[..n]));
+    let client = match globals::REDIS_CLIENT.get() {
+        Some(client) => client.clone(),
+        None => {
+            eprintln!("log forwarder: redis client not set");
+            return;
+        }
+    };
+    let mut conn = match client.get_multiplexed_async_connection().await {
+        Ok(conn) => conn,
+        Err(err) => {
+            eprintln!("log forwarder: redis connect failed: {err}");
+            return;
+        }
+    };
+
+    let mut line_buf = String::new();
+    while let Some(item) = stream.next().await {
+        let LogFrame { stream, payload } = match item {
+            Ok(frame) => frame,
+            Err(err) => {
+                eprintln!("log forwarder: stream error: {err}");
+                break;
+            }
+        };
+        let chunk = String::from_utf8_lossy(&payload);
+        line_buf.push_str(&chunk);
         while let Some(pos) = line_buf.find('\n') {
             let line = line_buf[..pos].to_string();
             line_buf.drain(..=pos);
             if !line.is_empty() {
-                let payload = format!("{}$info$stdout: {}", timestamp(), line);
-                let _: Result<(), _> = redis::cmd("XADD")
-                    .arg(format!("logs:{}", container_id))
-                    .arg("*")
-                    .arg("msg")
-                    .arg(&payload)
-                    .query_async(&mut conn)
-                    .await;
+                forward_line(&mut conn, &container_id, stream, &line).await;
             }
         }
     }
-
     if !line_buf.is_empty() {
-        let payload = format!("{}$info$stdout: {}", timestamp(), line_buf);
-        let _: Result<(), _> = redis::cmd("XADD")
-            .arg(format!("logs:{}", container_id))
-            .arg("*")
-            .arg("msg")
-            .arg(&payload)
-            .query_async(&mut conn)
-            .await;
-    }
-
-    Ok(())
-}
-
-async fn accept_connection(
-    listener: &AsyncFd<std::os::unix::net::UnixListener>,
-) -> Result<std::os::unix::net::UnixStream, io::Error> {
-    loop {
-        let mut guard = listener
-            .readable()
-            .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        match guard.try_io(|inner| {
-            let (stream, _) = inner.get_ref().accept()?;
-            Ok(stream)
-        }) {
-            Ok(Ok(stream)) => return Ok(stream),
-            Ok(Err(e)) => return Err(e),
-            Err(_WouldBlock) => continue,
-        }
+        forward_line(&mut conn, &container_id, LogStream::Stdout, &line_buf).await;
+        line_buf.clear();
     }
 }
 
-fn receive_fd(mut stream: std::os::unix::net::UnixStream) -> Result<OwnedFd, io::Error> {
-    stream.set_nonblocking(false)?;
-
-    let mut buf = [0u8; 1];
-    let mut iov = [std::io::IoSliceMut::new(&mut buf)];
-    let mut cmsg_buffer = Vec::with_capacity(128);
-
-    let fd = stream.as_raw_fd();
-    let msg = recvmsg::<UnixAddr>(
-        fd,
-        &mut iov,
-        Some(&mut cmsg_buffer),
-        MsgFlags::MSG_CMSG_CLOEXEC,
-    )
-    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-    let cmsgs = msg.cmsgs().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    for cmsg in cmsgs {
-        if let ControlMessageOwned::ScmRights(fds) = cmsg {
-            if let Some(&raw_fd) = fds.first() {
-                return Ok(unsafe { OwnedFd::from_raw_fd(raw_fd) });
+async fn connect_logs(
+    runtime: &crate::docker::DockerRuntime,
+    container_id: &str,
+) -> Result<
+    std::pin::Pin<
+        Box<dyn futures::Stream<Item = Result<LogFrame, crate::container::ContainerError>> + Send>,
+    >,
+    crate::container::ContainerError,
+> {
+    let mut last_err: Option<crate::container::ContainerError> = None;
+    for _ in 0..30 {
+        match runtime.logs(container_id).await {
+            Ok(stream) => return Ok(Box::pin(stream)),
+            Err(err) => {
+                last_err = Some(err);
+                tokio::time::sleep(Duration::from_millis(200)).await;
             }
         }
     }
-
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        "no fd received via SCM_RIGHTS",
-    ))
+    Err(last_err.unwrap_or_else(|| crate::container::ContainerError::Docker {
+        operation: "logs",
+        message: "failed to attach to container logs".into(),
+    }))
 }
 
-async fn read_pty(fd: &AsyncFd<OwnedFd>, buf: &mut [u8]) -> Result<usize, io::Error> {
-    loop {
-        let mut guard = fd.readable().await?;
-        match guard.try_io(|inner| {
-            let n = unsafe {
-                libc::read(
-                    inner.get_ref().as_raw_fd(),
-                    buf.as_mut_ptr() as *mut libc::c_void,
-                    buf.len() as libc::size_t,
-                )
-            };
-            if n < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(n as usize)
-        }) {
-            Ok(Ok(n)) => return Ok(n),
-            Ok(Err(e)) => return Err(e),
-            Err(_WouldBlock) => continue,
-        }
-    }
+async fn forward_line(
+    conn: &mut redis::aio::MultiplexedConnection,
+    container_id: &str,
+    stream: LogStream,
+    line: &str,
+) {
+    let prefix = match stream {
+        LogStream::Stdout => "stdout",
+        LogStream::Stderr => "stderr",
+        LogStream::Stdin => "stdin",
+    };
+    let payload = format!("{}$info${prefix}: {}", timestamp(), line);
+    let _: Result<(), _> = redis::cmd("XADD")
+        .arg(format!("logs:{container_id}"))
+        .arg("*")
+        .arg("msg")
+        .arg(&payload)
+        .query_async(conn)
+        .await;
 }
 
 fn timestamp() -> u64 {

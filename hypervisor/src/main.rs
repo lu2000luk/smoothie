@@ -1,7 +1,7 @@
 mod container;
+mod docker;
 mod globals;
 mod image;
-#[cfg(unix)]
 mod log;
 mod package;
 mod port;
@@ -88,6 +88,11 @@ struct Config {
     port: Option<u16>,
     host: Option<String>,
     s3: S3Config,
+    /// Optional override for the Docker / Podman socket path. When omitted, the
+    /// supervisor searches a list of well-known locations and refuses to start
+    /// if none of them work.
+    #[serde(default)]
+    docker_socket: Option<String>,
     #[serde(default = "defaults::idle_containers")]
     idle_containers: u32,
     #[serde(default = "defaults::max_hybernated_containers")]
@@ -122,6 +127,17 @@ mod defaults {
     pub fn cpu_q() -> u64 {
         12_500
     }
+}
+
+fn resolve_docker_socket(configured: Option<String>) -> PathBuf {
+    if let Some(value) = configured {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    docker::default_docker_socket()
+        .unwrap_or_else(|| PathBuf::from("/var/run/docker.sock"))
 }
 
 #[actix_web::get("/package/prepare/{id}")]
@@ -234,7 +250,7 @@ async fn kill_container(
         }
     };
 
-    match state.api.kill(entry.container) {
+    match state.api.kill(entry.container).await {
         Ok(()) => actix_web::HttpResponse::Ok().json(serde_json::json!({"status": "ok"})),
         Err(e) => actix_web::HttpResponse::InternalServerError()
             .json(serde_json::json!({"error": e.to_string()})),
@@ -403,7 +419,11 @@ async fn main() -> std::io::Result<()> {
         .parent()
         .expect("base rootfs has no parent");
 
-    println!("Initializing container runtime...");
+    let docker_socket = resolve_docker_socket(config.docker_socket.clone());
+    println!(
+        "Connecting to Docker / Podman socket at {}...",
+        docker_socket.display()
+    );
 
     let runtime_root = data_root.join("runtime");
     let idle_root = data_root.join("containers").join("idle");
@@ -414,9 +434,24 @@ async fn main() -> std::io::Result<()> {
     globals::SOCKETS_DIR
         .set(sockets_dir)
         .expect("Failed to set sockets directory");
-    globals::RUNTIME
-        .set(container::CrunRuntime::new(runtime_root))
-        .expect("Failed to initialize container runtime");
+
+    let docker_runtime = docker::DockerRuntime::connect(docker_socket.clone(), base_rootfs.clone(), runtime_root.clone())
+        .await
+        .map_err(|e| {
+            eprintln!(
+                "Failed to connect to Docker / Podman socket at {}: {e}",
+                docker_socket.display()
+            );
+            std::io::Error::other(e)
+        })?;
+
+    let docker_runtime = Arc::new(docker_runtime);
+    globals::DOCKER_SOCKET
+        .set(docker_socket.clone())
+        .expect("Failed to set docker socket path");
+    globals::DOCKER_RUNTIME
+        .set(Arc::clone(&docker_runtime))
+        .expect("Failed to set docker runtime");
 
     println!("Initializing idle containers...");
 
@@ -433,7 +468,7 @@ async fn main() -> std::io::Result<()> {
     let port = config.port.unwrap_or(8080);
 
     let api = container::ContainerApi::new(
-        globals::RUNTIME.get().expect("RUNTIME not set").clone(),
+        Arc::clone(&docker_runtime),
         globals::IDLE_CONTAINERS
             .get()
             .expect("IDLE_CONTAINERS not set")
