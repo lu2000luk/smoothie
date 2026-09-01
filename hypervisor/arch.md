@@ -3,7 +3,7 @@
 (everything expandable for future modes/optimizations)
 2 running modes: process/container
 
-container: run with crun (use libcrun directly)
+container: run through a Docker/Podman-compatible engine socket (Podman serves the Docker API on its socket, so either works). The socket path is the `engine.socket` config option and is required - the hypervisor refuses to start without a reachable engine.
 boot modes: - Restart (simple cold boot) - Freeze (docker pause the container and keep it as long as we can, delete it whenever limits are reached) - Hybernate (snapshot ram and keep into disk, have a storage quota and delete with LRU policy)
 
 process: run all processes inside the same container but each process with cgroups stuff (nix crate)
@@ -13,23 +13,26 @@ package format: (since we have multiple run modes the apps are packaged in an un
 
 container API:
 - `select_tarball(path)` validates the selected `.tar` file.
-- `inject(tarball, argv)` expands it into an idle container.
-- `run(injected, container_port)` starts it and publishes a host port chosen by `port.rs`.
-- `kill(running)` stops the container, removes its crun state, and closes its published port.
+- `inject(tarball, argv)` uploads it into an idle container (the engine extracts it at `/`).
+- `run(injected, container_port)` execs the entrypoint inside the container and publishes a host port chosen by `port.rs`.
+- `kill(running)` force-removes the container and closes its published port.
 
-Published ports use a retained host TCP listener and relay to `127.0.0.1:container_port`. This gives Docker-style `HOST_PORT:CONTAINER_PORT` behaviour: the host port is selected and reserved by Smoothie, while an application can listen on any distinct container port. The current crun networking implementation uses the host network namespace so the relay can reach the application; a future isolated namespace backend must preserve this API and route the relay to that namespace instead.
+performance: idle containers are created and started ahead of time (parked on `sleep infinity` in the base image), so `inject` is only a tar upload into an already-running container and `run` is only an exec - the hot path never pays a container cold start. The idle pool is topped back up slowly in the background whenever a slot is consumed (never above `idle_containers`, one at a time with a pause, so replenishing never stresses the system).
 
-hypervisor only stuff:
-always run 1/2 parent containers (all containers with crun!), one for x86, the other for arm (auto detect the system's aarch and choose the one to emulate)
-run everything else inside: - 1 unlimited container for the process run mode - X idle containers ready to get injected - X running containers - X hybernated containers
+Published ports use a retained host TCP listener and relay to `127.0.0.1:container_port`. This gives Docker-style `HOST_PORT:CONTAINER_PORT` behaviour: the host port is selected and reserved by Smoothie, while an application can listen on any distinct container port. Containers currently share the host network namespace so the relay can reach the application; a future isolated namespace backend must preserve this API and route the relay to that namespace instead.
+
+cleanup: every container the hypervisor creates is labeled `io.smoothie.hypervisor=1` plus `io.smoothie.instance=<run id>`. On startup anything carrying the managed label is force-removed (leftovers from a crashed or SIGKILLed run), and on graceful shutdown (SIGINT/SIGTERM) the hypervisor removes everything its own instance created. `docker ps -a --filter label=io.smoothie.hypervisor` shows what the hypervisor owns at any time.
+
+future backends: `engine.rs` is the only module that talks to the engine API; the lifecycle in `container.rs` (idle pool, port relay, log forwarding) is backend-agnostic. Multi-arch "parent containers" from the original crun plan map to engine platform selection (pull the base image per platform) and can be added without touching the container API.
 
 configs:
+engine: { socket: string (path to the Docker/Podman API socket) [required], image: string [default: docker.io/library/alpine:3.24] }
 idle_containers: num (try to always reach this number, never go higher, dont stress the system to reach this, do it slowly) [default: 5]
 max_hybernated_containers: num [default: 20]
 snapshots_storage_quota: num (bytes) [default: 209715200 (200mb)]
 package_cache_quota: num (bytes) [default: 524288000 (500mb)]
 run_multiple_aarch: bool (if true run 2 parent containers, one for each aarch [x84/arm] otherwise only run one for the current aarch)
-resource_limits: (per container/process)
+resource_limits: (per container/process, applied when each container is created)
 ram: num (bytes) [default: 26214400 (25mb)]
 cpu_p: num (period) [default: 50000]
 cpu_q: num (quota) [default: 12500]

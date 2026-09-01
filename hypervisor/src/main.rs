@@ -1,12 +1,11 @@
 mod container;
+mod engine;
 mod globals;
-mod image;
-#[cfg(unix)]
 mod log;
 mod package;
 mod port;
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use actix_web::{App, HttpServer, web};
 use serde::{Deserialize, Serialize};
@@ -23,6 +22,7 @@ struct RunningEntry {
 }
 
 struct AppState {
+    engine: Arc<engine::Engine>,
     api: container::ContainerApi,
     injected: Mutex<HashMap<String, InjectedEntry>>,
     running: Mutex<HashMap<String, RunningEntry>>,
@@ -63,6 +63,17 @@ struct S3Config {
 }
 
 #[derive(Serialize, Deserialize)]
+struct EngineConfig {
+    /// Path to a Docker- or Podman-compatible API socket,
+    /// e.g. "/var/run/docker.sock" or "/run/podman/podman.sock".
+    /// Required: the hypervisor refuses to start without it.
+    socket: String,
+    /// Base image idle containers are started from.
+    #[serde(default = "defaults::image")]
+    image: String,
+}
+
+#[derive(Serialize, Deserialize)]
 struct ResourceLimits {
     #[serde(default = "defaults::ram")]
     ram: u64,
@@ -88,6 +99,7 @@ struct Config {
     port: Option<u16>,
     host: Option<String>,
     s3: S3Config,
+    engine: EngineConfig,
     #[serde(default = "defaults::idle_containers")]
     idle_containers: u32,
     #[serde(default = "defaults::max_hybernated_containers")]
@@ -121,6 +133,25 @@ mod defaults {
     }
     pub fn cpu_q() -> u64 {
         12_500
+    }
+    pub fn image() -> String {
+        // Fully qualified so Podman resolves it without unqualified-search
+        // registry configuration.
+        "docker.io/library/alpine:3.24".into()
+    }
+}
+
+impl ResourceLimits {
+    fn to_engine(&self) -> engine::ResourceLimits {
+        let as_limit = |value: u64| i64::try_from(value).ok();
+        engine::ResourceLimits {
+            memory_bytes: as_limit(self.ram),
+            // No extra swap beyond the RAM limit.
+            memory_swap_bytes: as_limit(self.ram),
+            cpu_period_us: as_limit(self.cpu_p),
+            cpu_quota_us: as_limit(self.cpu_q),
+            pids: None,
+        }
     }
 }
 
@@ -234,7 +265,7 @@ async fn kill_container(
         }
     };
 
-    match state.api.kill(entry.container) {
+    match state.api.kill(entry.container).await {
         Ok(()) => actix_web::HttpResponse::Ok().json(serde_json::json!({"status": "ok"})),
         Err(e) => actix_web::HttpResponse::InternalServerError()
             .json(serde_json::json!({"error": e.to_string()})),
@@ -260,21 +291,14 @@ async fn get_container_port(
 async fn list_containers(state: web::Data<AppState>) -> actix_web::HttpResponse {
     let mut containers: Vec<ContainerInfo> = Vec::new();
 
-    if let Some(idle_pool) = globals::IDLE_CONTAINERS.get() {
-        let idle_ids = idle_pool.list_ids().await;
-        for id in idle_ids {
-            let is_injected = state.injected.lock().await.contains_key(&id);
-            let is_running = state.running.lock().await.contains_key(&id);
-            if !is_injected && !is_running {
-                containers.push(ContainerInfo {
-                    id,
-                    package: None,
-                    idle: Some(true),
-                    c_port: None,
-                    h_port: None,
-                });
-            }
-        }
+    for id in state.api.idle_ids().await {
+        containers.push(ContainerInfo {
+            id,
+            package: None,
+            idle: Some(true),
+            c_port: None,
+            h_port: None,
+        });
     }
 
     for (id, entry) in state.injected.lock().await.iter() {
@@ -300,11 +324,11 @@ async fn list_containers(state: web::Data<AppState>) -> actix_web::HttpResponse 
     actix_web::HttpResponse::Ok().json(containers)
 }
 
-#[actix_web::get("/image/ensure/alpine")]
-async fn ensure_alpine_route() -> actix_web::HttpResponse {
-    match image::ensure_alpine().await {
-        Ok(path) => actix_web::HttpResponse::Ok()
-            .json(serde_json::json!({"status": "ok", "path": path.to_string_lossy()})),
+#[actix_web::get("/image/ensure")]
+async fn ensure_image_route(state: web::Data<AppState>) -> actix_web::HttpResponse {
+    match state.engine.ensure_image().await {
+        Ok(()) => actix_web::HttpResponse::Ok()
+            .json(serde_json::json!({"status": "ok", "image": state.engine.image()})),
         Err(e) => actix_web::HttpResponse::InternalServerError()
             .json(serde_json::json!({"error": e.to_string()})),
     }
@@ -326,6 +350,10 @@ async fn main() -> std::io::Result<()> {
         Ok(cfg) => cfg,
         Err(e) => {
             eprintln!("Failed to parse configuration file: {}", e);
+            eprintln!(
+                "Note: the hypervisor requires an \"engine\" section pointing at a \
+Docker/Podman API socket, e.g. {{\"engine\": {{\"socket\": \"/var/run/docker.sock\"}}}}"
+            );
             std::process::exit(1);
         }
     };
@@ -381,66 +409,63 @@ async fn main() -> std::io::Result<()> {
         .set(Mutex::new(HashMap::new()))
         .expect("Failed to set download locks");
 
-    println!("Preparing package...");
+    println!("Preparing package cache...");
 
     package::ensure_dirs();
     package::cleanup_stale_temps();
 
-    println!("Ensuring Alpine image is available...");
+    println!(
+        "Connecting to container engine at {}...",
+        config.engine.socket
+    );
 
-    let alpine_archive = image::ensure_alpine()
-        .await
-        .map_err(std::io::Error::other)?;
+    let engine = match engine::Engine::connect(
+        &config.engine.socket,
+        config.engine.image.clone(),
+        config.resource_limits.to_engine(),
+    )
+    .await
+    {
+        Ok(engine) => Arc::new(engine),
+        Err(e) => {
+            eprintln!(
+                "Failed to reach the container engine socket {}: {}",
+                config.engine.socket, e
+            );
+            eprintln!("The hypervisor does not run without a working Docker/Podman socket.");
+            std::process::exit(1);
+        }
+    };
 
-    println!("Preparing base rootfs...");
+    println!("Cleaning up containers left over from previous runs...");
 
-    let base_rootfs = tokio::task::spawn_blocking(move || image::ensure_base_rootfs(&alpine_archive))
-        .await
-        .map_err(std::io::Error::other)?
-        .map_err(std::io::Error::other)?;
+    match engine.cleanup_leftovers().await {
+        Ok(0) => {}
+        Ok(removed) => println!("Removed {removed} leftover container(s)"),
+        Err(e) => {
+            eprintln!("Failed to clean up leftover containers: {}", e);
+            std::process::exit(1);
+        }
+    }
 
-    let data_root = base_rootfs
-        .parent()
-        .expect("base rootfs has no parent");
+    println!("Ensuring base image {} is available...", config.engine.image);
 
-    println!("Initializing container runtime...");
-
-    let runtime_root = data_root.join("runtime");
-    let idle_root = data_root.join("containers").join("idle");
-    let sockets_dir = PathBuf::from("/tmp/smoothie/sock");
-    std::fs::create_dir_all(&runtime_root)?;
-    std::fs::create_dir_all(&idle_root)?;
-    std::fs::create_dir_all(&sockets_dir)?;
-    globals::SOCKETS_DIR
-        .set(sockets_dir)
-        .expect("Failed to set sockets directory");
-    globals::RUNTIME
-        .set(container::CrunRuntime::new(runtime_root))
-        .expect("Failed to initialize container runtime");
+    engine.ensure_image().await.map_err(std::io::Error::other)?;
 
     println!("Initializing idle containers...");
 
-    globals::IDLE_CONTAINERS
-        .set(Arc::new(
-            container::IdleContainerPool::new(idle_root, base_rootfs, config.idle_containers)
-                .await
-                .map_err(std::io::Error::other)?,
-        ))
-        .expect("Failed to initialize idle containers");
+    let idle_pool = container::IdleContainerPool::new(engine.clone(), config.idle_containers)
+        .await
+        .map_err(std::io::Error::other)?;
 
     println!("Starting server...");
 
     let port = config.port.unwrap_or(8080);
 
-    let api = container::ContainerApi::new(
-        globals::RUNTIME.get().expect("RUNTIME not set").clone(),
-        globals::IDLE_CONTAINERS
-            .get()
-            .expect("IDLE_CONTAINERS not set")
-            .clone(),
-    );
+    let api = container::ContainerApi::new(engine.clone(), idle_pool);
 
     let app_state = web::Data::new(AppState {
+        engine: engine.clone(),
         api,
         injected: Mutex::new(HashMap::new()),
         running: Mutex::new(HashMap::new()),
@@ -448,7 +473,7 @@ async fn main() -> std::io::Result<()> {
 
     println!("Started server: http://localhost:{}", port);
 
-    HttpServer::new(move || {
+    let result = HttpServer::new(move || {
         App::new()
             .app_data(app_state.clone())
             .service(prepare_package_route)
@@ -458,9 +483,25 @@ async fn main() -> std::io::Result<()> {
             .service(kill_container)
             .service(get_container_port)
             .service(list_containers)
-            .service(ensure_alpine_route)
+            .service(ensure_image_route)
     })
     .bind((config.host.unwrap_or_else(|| "0.0.0.0".into()), port))?
     .run()
-    .await
+    .await;
+
+    // Graceful shutdown (SIGINT/SIGTERM): remove every container this run
+    // created. A SIGKILLed run is covered by cleanup_leftovers on next boot.
+    println!("Shutting down: removing managed containers...");
+    match engine.cleanup_instance().await {
+        Ok(removed) => println!("Removed {removed} container(s)"),
+        Err(e) => eprintln!(
+            "Failed to remove managed containers: {}; they are labeled {}={} and will be \
+removed on next startup",
+            e,
+            engine::MANAGED_LABEL,
+            engine::MANAGED_LABEL_VALUE
+        ),
+    }
+
+    result
 }
