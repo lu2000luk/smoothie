@@ -28,7 +28,18 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const runner = new JobRunner();
 
-const CONFIG_PATH = path.join(PROJECT_ROOT, "hypervisor", "config.json");
+const CONFIG_PATHS = {
+  hypervisor: path.join(PROJECT_ROOT, "hypervisor", "config.json"),
+  router: path.join(PROJECT_ROOT, "router", "config.json"),
+};
+// Back-compat alias for the single-config UI.
+const CONFIG_PATH = CONFIG_PATHS.hypervisor;
+
+function resolveConfigTarget(input) {
+  const t = String(input ?? "hypervisor").toLowerCase();
+  if (t === "hypervisor" || t === "router") return t;
+  return null;
+}
 
 app.use(express.json());
 
@@ -390,36 +401,80 @@ app.get("/api/stream/:jobId", (req, res) => {
 
 /* ─── config ────────────────────────────────────────────────────── */
 
-app.get("/api/config", (_req, res) => {
-  if (fs.existsSync(CONFIG_PATH)) {
+app.get("/api/config", (req, res) => {
+  const target = resolveConfigTarget(req.query.target ?? "hypervisor");
+  if (!target) return res.status(400).json({ error: "Unknown config target (want hypervisor|router)" });
+  const file = CONFIG_PATHS[target];
+  if (fs.existsSync(file)) {
     try {
-      res.json({ exists: true, config: JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8")) });
+      res.json({ exists: true, config: JSON.parse(fs.readFileSync(file, "utf8")), target });
       return;
     } catch (err) {
-      res.status(500).json({ error: `config.json is not valid JSON: ${err.message}` });
+      res.status(500).json({ error: `${target}/config.json is not valid JSON: ${err.message}` });
       return;
     }
   }
-  res.json({ exists: false, config: null });
+  res.json({ exists: false, config: null, target });
 });
 
-app.post("/api/config", (req, res) => {
-  const { config } = req.body ?? {};
-  if (!config || typeof config !== "object") {
-    return res.status(400).json({ error: "Body must be { config: {...} }" });
-  }
+function validateHypervisorConfig(config) {
   // Basic shape validation mirroring hypervisor expectations
   const required = ["s3", "redis", "port", "host", "engine"];
   for (const key of required) {
-    if (!(key in config)) return res.status(400).json({ error: `Missing required key: ${key}` });
+    if (!(key in config)) return `Missing required key: ${key}`;
   }
   for (const key of ["socket"]) {
     if (!config.engine || typeof config.engine !== "object" || !(key in config.engine))
-      return res.status(400).json({ error: `Missing engine.${key}` });
+      return `Missing engine.${key}`;
   }
+  return null;
+}
+
+function validateRouterConfig(config) {
+  // Mirrors router/src/main.rs Config + ServerConfig + S3Config
+  const required = ["servers", "redis", "s3"];
+  for (const key of required) {
+    if (!(key in config)) return `Missing required key: ${key}`;
+  }
+  if (!Array.isArray(config.servers)) return "servers must be an array";
+  for (let i = 0; i < config.servers.length; i++) {
+    const s = config.servers[i];
+    if (!s || typeof s !== "object") return `servers[${i}] must be an object`;
+    for (const key of ["id", "address", "power"]) {
+      if (!(key in s)) return `Missing servers[${i}].${key}`;
+    }
+    if (typeof s.id !== "string" || !s.id) return `servers[${i}].id must be a non-empty string`;
+    if (typeof s.address !== "string" || !s.address) return `servers[${i}].address must be a non-empty string`;
+    if (typeof s.power !== "number" || !Number.isFinite(s.power) || s.power < 0)
+      return `servers[${i}].power must be a number >= 0`;
+    if ("tunnel" in s && typeof s.tunnel !== "boolean") return `servers[${i}].tunnel must be a boolean`;
+    if (s.tunnel_address != null && typeof s.tunnel_address !== "string")
+      return `servers[${i}].tunnel_address must be a string`;
+  }
+  if (typeof config.redis !== "string" || !config.redis) return "redis must be a non-empty string";
+  if (!config.s3 || typeof config.s3 !== "object") return "s3 must be an object";
+  for (const key of ["access_key", "secret_key", "bucket", "region"]) {
+    if (!(key in config.s3)) return `Missing s3.${key}`;
+  }
+  if (config.port != null && (!Number.isInteger(config.port) || config.port < 1 || config.port > 65535))
+    return "port must be an integer 1-65535";
+  if (config.host != null && typeof config.host !== "string") return "host must be a string";
+  return null;
+}
+
+app.post("/api/config", (req, res) => {
+  const { config, target: rawTarget } = req.body ?? {};
+  const target = resolveConfigTarget(rawTarget ?? req.query.target ?? "hypervisor");
+  if (!target) return res.status(400).json({ error: "Unknown config target (want hypervisor|router)" });
+  if (!config || typeof config !== "object") {
+    return res.status(400).json({ error: "Body must be { config: {...} }" });
+  }
+  const err = target === "router" ? validateRouterConfig(config) : validateHypervisorConfig(config);
+  if (err) return res.status(400).json({ error: err });
   try {
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n");
-    res.json({ ok: true, path: CONFIG_PATH });
+    const file = CONFIG_PATHS[target];
+    fs.writeFileSync(file, JSON.stringify(config, null, 2) + "\n");
+    res.json({ ok: true, path: file, target });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

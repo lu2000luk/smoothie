@@ -1,6 +1,7 @@
 mod container;
 mod engine;
 mod globals;
+mod instant_box;
 mod log;
 mod package;
 mod port;
@@ -208,10 +209,13 @@ async fn inject_container(
     };
 
     let id = injected.id().to_string();
-    state.injected.lock().await.insert(id.clone(), InjectedEntry {
-        package_id: package_id.clone(),
-        container: injected,
-    });
+    state.injected.lock().await.insert(
+        id.clone(),
+        InjectedEntry {
+            package_id: package_id.clone(),
+            container: injected,
+        },
+    );
 
     actix_web::HttpResponse::Ok().json(serde_json::json!({"id": id}))
 }
@@ -243,13 +247,37 @@ async fn run_container(
     let host_port = running.host_port();
     let container_port = running.container_port();
     let rid = running.id().to_string();
-    state.running.lock().await.insert(rid.clone(), RunningEntry {
-        package_id: entry.package_id,
-        container: running,
-    });
+    state.running.lock().await.insert(
+        rid.clone(),
+        RunningEntry {
+            package_id: entry.package_id,
+            container: running,
+        },
+    );
 
-    actix_web::HttpResponse::Ok()
-        .json(serde_json::json!({"id": rid, "host_port": host_port, "container_port": container_port}))
+    actix_web::HttpResponse::Ok().json(
+        serde_json::json!({"id": rid, "host_port": host_port, "container_port": container_port}),
+    )
+}
+
+#[actix_web::post("/container/shutdown/{id}")]
+async fn shutdown_container(
+    state: web::Data<AppState>,
+    id: web::Path<String>,
+) -> actix_web::HttpResponse {
+    let entry = match state.running.lock().await.remove(&*id) {
+        Some(e) => e,
+        None => {
+            return actix_web::HttpResponse::NotFound()
+                .json(serde_json::json!({"error": "running container not found"}));
+        }
+    };
+
+    match state.api.shutdown(entry.container).await {
+        Ok(()) => actix_web::HttpResponse::Ok().json(serde_json::json!({"status": "ok"})),
+        Err(e) => actix_web::HttpResponse::InternalServerError()
+            .json(serde_json::json!({"error": e.to_string()})),
+    }
 }
 
 #[actix_web::post("/container/kill/{id}")]
@@ -448,7 +476,10 @@ Docker/Podman API socket, e.g. {{\"engine\": {{\"socket\": \"/var/run/docker.soc
         }
     }
 
-    println!("Ensuring base image {} is available...", config.engine.image);
+    println!(
+        "Ensuring base image {} is available...",
+        config.engine.image
+    );
 
     engine.ensure_image().await.map_err(std::io::Error::other)?;
 
@@ -470,20 +501,25 @@ Docker/Podman API socket, e.g. {{\"engine\": {{\"socket\": \"/var/run/docker.soc
         injected: Mutex::new(HashMap::new()),
         running: Mutex::new(HashMap::new()),
     });
+    let box_registry = web::Data::new(instant_box::BoxRegistry::new(engine.clone()));
 
     println!("Started server: http://localhost:{}", port);
 
     let result = HttpServer::new(move || {
         App::new()
             .app_data(app_state.clone())
+            .app_data(box_registry.clone())
             .service(prepare_package_route)
             .service(get_package_route)
             .service(inject_container)
             .service(run_container)
+            .service(shutdown_container)
             .service(kill_container)
             .service(get_container_port)
             .service(list_containers)
             .service(ensure_image_route)
+            .service(instant_box::create_box)
+            .service(instant_box::connect_box)
     })
     .bind((config.host.unwrap_or_else(|| "0.0.0.0".into()), port))?
     .run()

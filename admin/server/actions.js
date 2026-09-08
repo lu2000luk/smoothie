@@ -301,10 +301,18 @@ export const actions = [
   {
     id: "start-router",
     title: "Start router",
-    description: "Runs the router with cargo run (release). Keeps running until you stop it.",
+    description:
+      "Runs the router with cargo run (release). Refuses to start without router/config.json — use the Config tab (Router) first if it doesn't exist yet. Keeps running until you stop it.",
     group: "run",
     longRunning: true,
-    steps: [{ cmd: "cargo run --release", cwd: "router", note: "Starts the router (stays running; stop via its Stop button, the Stop-router action, or the Jobs panel)." }],
+    steps: [
+      {
+        cmd: "test -f config.json && echo 'config.json found' || (echo 'MISSING config.json — generate it in the Config tab (Router) first' && exit 1)",
+        cwd: "router",
+        note: "Sanity check: router refuses to boot without config.json.",
+      },
+      { cmd: "cargo run --release", cwd: "router", note: "Starts the router (stays running; stop via its Stop button, the Stop-router action, or the Jobs panel)." },
+    ],
   },
   {
     id: "start-ui",

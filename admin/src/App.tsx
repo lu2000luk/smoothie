@@ -319,7 +319,7 @@ export default function App() {
           >
             Config
             <Badge variant="secondary" className="h-5 px-1.5 text-[10px]">
-              1
+              2
             </Badge>
           </a>
         </nav>

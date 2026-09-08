@@ -18,10 +18,11 @@ use std::collections::HashMap;
 use bollard::models::{ContainerCreateBody, ExecConfig, HostConfig};
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptionsBuilder, ListContainersOptionsBuilder,
-    RemoveContainerOptionsBuilder, UploadToContainerOptionsBuilder,
+    RemoveContainerOptionsBuilder, StopContainerOptionsBuilder, UploadToContainerOptionsBuilder,
 };
 use bollard::{API_DEFAULT_VERSION, Docker, body_full};
 use futures::{Stream, StreamExt};
+use tokio::io::AsyncWrite;
 use uuid::Uuid;
 
 pub use bollard::container::LogOutput;
@@ -31,6 +32,13 @@ pub type Result<T> = std::result::Result<T, EngineError>;
 
 /// Combined stdout/stderr stream of a process exec'd inside a container.
 pub type ExecOutput = std::pin::Pin<Box<dyn Stream<Item = Result<LogOutput>> + Send>>;
+/// Stdin attached to a process exec'd inside a container.
+pub type ExecInput = std::pin::Pin<Box<dyn AsyncWrite + Send>>;
+
+pub struct InteractiveExec {
+    pub input: ExecInput,
+    pub output: ExecOutput,
+}
 
 /// Label present on every container the hypervisor creates, ever.
 pub const MANAGED_LABEL: &str = "io.smoothie.hypervisor";
@@ -62,7 +70,8 @@ impl Engine {
     /// Connects to the engine socket and verifies it responds to a ping.
     /// The hypervisor must not run without this succeeding.
     pub async fn connect(socket: &str, image: String, limits: ResourceLimits) -> Result<Self> {
-        let docker = Docker::connect_with_unix(socket, CONNECT_TIMEOUT_SECS, API_DEFAULT_VERSION)?;
+        let docker =
+            Docker::connect_with_socket(socket, CONNECT_TIMEOUT_SECS, API_DEFAULT_VERSION)?;
         docker.ping().await?;
         Ok(Self {
             docker,
@@ -159,6 +168,60 @@ impl Engine {
                 unreachable!("start_exec without detach always attaches")
             }
         }
+    }
+
+    /// Starts one interactive TTY process inside a running container.
+    pub async fn exec_interactive(
+        &self,
+        id: &str,
+        argv: Vec<String>,
+        cwd: &str,
+    ) -> Result<InteractiveExec> {
+        let exec = self
+            .docker
+            .create_exec(
+                id,
+                ExecConfig {
+                    attach_stdin: Some(true),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    cmd: Some(argv),
+                    tty: Some(true),
+                    working_dir: Some(cwd.into()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        match self.docker.start_exec(&exec.id, None).await? {
+            bollard::exec::StartExecResults::Attached { input, output } => {
+                Ok(InteractiveExec { input, output })
+            }
+            bollard::exec::StartExecResults::Detached => {
+                unreachable!("start_exec without detach always attaches")
+            }
+        }
+    }
+
+    /// Asks a container to stop normally, waits up to 30 seconds, then
+    /// force-removes it. Docker/Podman sends SIGKILL when the stop timeout
+    /// expires; forced removal also guarantees that the container is deleted.
+    pub async fn shutdown_container(&self, id: &str) -> Result<()> {
+        let options = StopContainerOptionsBuilder::new()
+            .signal("SIGTERM")
+            .t(30)
+            .build();
+        if let Err(error) = self.docker.stop_container(id, Some(options)).await {
+            match error {
+                EngineError::DockerResponseServerError {
+                    status_code: 304 | 404,
+                    ..
+                } => {}
+                error => eprintln!(
+                    "[engine] shutdown: graceful stop failed for {id}: {error}; forcing removal"
+                ),
+            }
+        }
+        self.remove_container(id).await
     }
 
     /// Force-removes a container (kills whatever is running inside it).

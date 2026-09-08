@@ -80,11 +80,7 @@ impl LineBuffer {
         }
     }
 
-    async fn flush(
-        &mut self,
-        container_id: &str,
-        conn: &mut redis::aio::MultiplexedConnection,
-    ) {
+    async fn flush(&mut self, container_id: &str, conn: &mut redis::aio::MultiplexedConnection) {
         if !self.pending.is_empty() {
             let line = std::mem::take(&mut self.pending);
             self.emit(&line, container_id, conn).await;
@@ -97,13 +93,7 @@ impl LineBuffer {
         container_id: &str,
         conn: &mut redis::aio::MultiplexedConnection,
     ) {
-        let payload = format!(
-            "{}${}${}: {}",
-            timestamp(),
-            self.level,
-            self.stream,
-            line
-        );
+        let payload = format!("{}${}${}: {}", timestamp(), self.level, self.stream, line);
         let _: Result<(), _> = redis::cmd("XADD")
             .arg(format!("logs:{container_id}"))
             .arg("*")

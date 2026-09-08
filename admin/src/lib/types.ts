@@ -153,3 +153,27 @@ export interface SmoothieConfig {
   };
   [key: string]: unknown;
 }
+
+export type ConfigTarget = "hypervisor" | "router";
+
+export interface RouterServerConfig {
+  id: string;
+  address: string;
+  tunnel: boolean;
+  tunnel_address?: string | null;
+  power: number;
+}
+
+export interface RouterConfig {
+  servers: RouterServerConfig[];
+  redis: string;
+  port?: number;
+  host?: string;
+  s3: {
+    access_key: string;
+    secret_key: string;
+    bucket: string;
+    region: string;
+  };
+  [key: string]: unknown;
+}

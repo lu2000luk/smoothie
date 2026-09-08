@@ -7,7 +7,9 @@
 //! The pool is topped back up slowly in the background whenever a slot is
 //! consumed.
 
-use std::{collections::VecDeque, fmt, io, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque, fmt, io, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration,
+};
 
 use tokio::{
     io::copy_bidirectional,
@@ -259,6 +261,22 @@ impl ContainerApi {
             port,
             log_task,
         })
+    }
+
+    pub async fn shutdown(&self, running: RunningContainer) -> Result<()> {
+        eprintln!("[container] shutdown: id={}", running.id);
+        let result = self.engine.shutdown_container(&running.id).await;
+        running.log_task.abort();
+        if let Err(ref error) = result {
+            eprintln!(
+                "[container] shutdown: id={} remove failed: {error}",
+                running.id
+            );
+        } else {
+            eprintln!("[container] shutdown: id={} done", running.id);
+        }
+        // `running.port` drops here, closing the published host port.
+        result.map_err(Into::into)
     }
 
     pub async fn kill(&self, running: RunningContainer) -> Result<()> {
