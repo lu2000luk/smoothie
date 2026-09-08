@@ -5,7 +5,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { Square, Trash2 } from "lucide-react";
+import { Square, Trash2, RotateCcw, Loader2 } from "lucide-react";
 
 const COLORS: Record<LogLine["stream"], string> = {
   stdout: "text-code-foreground",
@@ -17,14 +17,18 @@ export function JobTerminal({
   jobId,
   jobs,
   onKill,
+  onRestarted,
 }: {
   jobId: string | null;
   jobs: JobInfo[];
   onKill?: () => void;
+  onRestarted?: (newJobId: string) => void;
 }) {
   const [logs, setLogs] = useState<LogLine[]>([]);
   const [status, setStatus] = useState<string>("idle");
   const [autoScroll, setAutoScroll] = useState(true);
+  const [restarting, setRestarting] = useState(false);
+  const [restartError, setRestartError] = useState<string | null>(null);
   const viewportRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -35,6 +39,7 @@ export function JobTerminal({
     }
     setLogs([]);
     setStatus("connecting");
+    setRestartError(null);
     const es = api.stream(jobId, {
       onLog: (line) => {
         setLogs((prev) => [...prev.slice(-4999), line as LogLine]);
@@ -57,6 +62,21 @@ export function JobTerminal({
 
   const job = jobs.find((j) => j.id === jobId);
   const isRunning = status === "running";
+
+  const handleRestart = async () => {
+    if (!job || restarting) return;
+    setRestarting(true);
+    setRestartError(null);
+    try {
+      const { jobId: newJobId } = await api.restart(job.id);
+      onRestarted?.(newJobId);
+      onKill?.();
+    } catch (e) {
+      setRestartError((e as Error)?.message ?? "Restart failed");
+    } finally {
+      setRestarting(false);
+    }
+  };
 
   return (
     <Card className="flex min-h-[560px] flex-col">
@@ -96,6 +116,22 @@ export function JobTerminal({
               <Square className="h-3 w-3" /> Stop
             </Button>
           )}
+          {job && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={handleRestart}
+              disabled={restarting}
+              title={isRunning ? `Restart ${job.title} (stop + start again)` : `Run ${job.title} again`}
+            >
+              {restarting ? (
+                <Loader2 className="h-3 w-3 animate-spin" />
+              ) : (
+                <RotateCcw className="h-3 w-3" />
+              )}
+              Restart
+            </Button>
+          )}
           {job && !isRunning && (
             <Button size="icon-sm" variant="ghost" onClick={() => setLogs([])}>
               <Trash2 className="h-3.5 w-3.5" />
@@ -117,6 +153,9 @@ export function JobTerminal({
               <p className="text-muted-foreground">
                 Select a job on the left — or start an action from the Actions tab.
               </p>
+            )}
+            {restartError && (
+              <p className="mb-2 text-red-400">Restart failed: {restartError}</p>
             )}
             {logs.map((l, i) => (
               <div key={i} className={`whitespace-pre-wrap break-all ${COLORS[l.stream] ?? ""}`}>

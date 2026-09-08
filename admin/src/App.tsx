@@ -12,7 +12,15 @@ import { ActionCard } from "@/components/ActionCard";
 import { JobTerminal } from "@/components/JobTerminal";
 import { ConfigGenerator } from "@/components/ConfigGenerator";
 import { EnvironmentPanel } from "@/components/EnvironmentPanel";
-import { CupSoda, Moon, Sun, TriangleAlert, RefreshCw, ServerOff, Square } from "lucide-react";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { CupSoda, Moon, Sun, TriangleAlert, RefreshCw, ServerOff, Square, Power, RotateCcw } from "lucide-react";
 
 const GROUPS: { id: string; label: string }[] = [
   { id: "environment", label: "Environment" },
@@ -54,11 +62,52 @@ export default function App() {
   const [backendDown, setBackendDown] = useState(false);
   const [activeTab, setActiveTab] = useState("dashboard");
   const [stoppingId, setStoppingId] = useState<string | null>(null);
+  const [restartingId, setRestartingId] = useState<string | null>(null);
+  const [portalConfirm, setPortalConfirm] = useState<"restart" | "stop" | null>(null);
+  const [portalBusy, setPortalBusy] = useState<"restart" | "stop" | null>(null);
+  const [portalNotice, setPortalNotice] = useState<
+    { kind: "restarting" | "restarted" | "stopped" | "error"; text: string } | null
+  >(null);
 
   const { dark, toggle } = useDarkMode();
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Env refresh bookkeeping: Re-check must stay clickable while a probe is
+  // in flight — abort the stale request and ignore out-of-order responses
+  // so a slow WSL cold-boot can't wedge the button on "loading" forever.
+  const envSeqRef = useRef(0);
+  const envAbortRef = useRef<AbortController | null>(null);
+  // Snapshot of values refreshJobs needs, without making it unstable.
+  // (If refreshJobs depended on `env`/`actions`, every loadInitial() would
+  // create a new callback identity, re-trigger the effect below, call
+  // loadInitial() again → infinite refresh / flicker.)
+  const statusRef = useRef({ hasEnv: false, actionsLen: 0, envError: null as string | null, actionsError: null as string | null });
+  statusRef.current = { hasEnv: !!env, actionsLen: actions.length, envError, actionsError };
+
+  const refreshEnv = useCallback(async () => {
+    const seq = ++envSeqRef.current;
+    envAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    envAbortRef.current = ctrl;
+    setEnvLoading(true);
+    setEnvError(null);
+    try {
+      // fresh=1 bypasses the server's 8s dedup cache (StrictMode double-mount).
+      const data = await api.env({ fresh: true, signal: ctrl.signal });
+      if (envSeqRef.current !== seq) return; // superseded by a newer click
+      setEnv(data);
+      setEnvError(null);
+      setBackendDown(false);
+    } catch (err) {
+      if ((err as Error)?.name === "AbortError") return;
+      if (envSeqRef.current !== seq) return;
+      setEnvError((err as Error)?.message ?? "Failed to load environment");
+    } finally {
+      if (envSeqRef.current === seq) setEnvLoading(false);
+    }
+  }, []);
 
   const loadInitial = useCallback(async () => {
+    const seq = ++envSeqRef.current;
     setEnvLoading(true);
     setActionsLoading(true);
     setEnvError(null);
@@ -67,6 +116,8 @@ export default function App() {
 
     // Independent fetches: one failing must not block the other.
     const [envRes, actionsRes] = await Promise.allSettled([api.env(), api.actions()]);
+
+    if (envSeqRef.current !== seq) return; // superseded by a Re-check click
 
     if (envRes.status === "fulfilled") {
       setEnv(envRes.value);
@@ -96,20 +147,20 @@ export default function App() {
   }, []);
 
   const refreshJobs = useCallback(async () => {
+    const snap = statusRef.current;
     try {
       setJobs(await api.jobs());
       setJobsError(null);
       // If jobs recover, clear a backend-down banner that was jobs-only.
-      setBackendDown((prev) => (envError || actionsError ? prev : false));
+      setBackendDown((prev) => (snap.envError || snap.actionsError ? prev : false));
     } catch (err) {
       const msg = (err as Error)?.message ?? "Failed to load jobs";
       setJobsError(msg);
-      if (isBackendUnreachable(err) && !env && actions.length === 0) {
+      if (isBackendUnreachable(err) && !snap.hasEnv && snap.actionsLen === 0) {
         setBackendDown(true);
       }
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [env, actions.length, envError, actionsError]);
+  }, []);
 
   useEffect(() => {
     loadInitial();
@@ -146,6 +197,93 @@ export default function App() {
     setActiveJobId(jobId);
     setActiveTab("jobs");
   }, []);
+
+  const restartJob = useCallback(
+    async (jobId: string) => {
+      setRestartingId(jobId);
+      try {
+        const { jobId: newJobId } = await api.restart(jobId);
+        setActiveJobId(newJobId);
+      } catch {
+        /* restart failures surface on next poll / terminal; keep old selection */
+      } finally {
+        setRestartingId(null);
+        refreshJobs();
+      }
+    },
+    [refreshJobs]
+  );
+
+  const waitForPortalBack = useCallback(async () => {
+    for (let i = 0; i < 30; i++) {
+      await new Promise((r) => setTimeout(r, 1000));
+      try {
+        await api.env();
+        return true;
+      } catch {
+        /* still down — keep polling */
+      }
+    }
+    return false;
+  }, []);
+
+  const confirmPortalAction = useCallback(async () => {
+    const kind = portalConfirm;
+    if (!kind) return;
+    setPortalConfirm(null);
+    setPortalBusy(kind);
+    setPortalNotice(
+      kind === "restart"
+        ? { kind: "restarting", text: "Restarting admin portal — the api is respawning…" }
+        : { kind: "stopped", text: "Stopping admin portal…" }
+    );
+    try {
+      if (kind === "restart") {
+        await api.restartPortal();
+        const back = await waitForPortalBack();
+        if (back) {
+          setPortalNotice({ kind: "restarted", text: "Admin portal restarted." });
+          await loadInitial();
+          await refreshJobs();
+        } else {
+          setPortalNotice({
+            kind: "error",
+            text: "Restart was requested but the api did not come back within 30s. Restart it manually: cd admin && npm run dev.",
+          });
+        }
+      } else {
+        await api.stopPortal();
+        setBackendDown(true);
+        setPortalNotice({
+          kind: "stopped",
+          text: "Admin portal stopped. Restart it manually: cd admin && npm run dev (or node server/index.js).",
+        });
+      }
+    } catch (err) {
+      // A fetch failure right after POST usually means the process already
+      // exited — for restart, still wait for it to come back.
+      if (kind === "restart") {
+        const back = await waitForPortalBack();
+        if (back) {
+          setPortalNotice({ kind: "restarted", text: "Admin portal restarted." });
+          await loadInitial();
+          await refreshJobs();
+        } else {
+          setPortalNotice({
+            kind: "error",
+            text: `Restart request failed: ${(err as Error)?.message ?? "unknown error"}`,
+          });
+        }
+      } else {
+        setPortalNotice({
+          kind: "error",
+          text: `Stop request failed: ${(err as Error)?.message ?? "unknown error"}`,
+        });
+      }
+    } finally {
+      setPortalBusy(null);
+    }
+  }, [portalConfirm, loadInitial, refreshJobs, waitForPortalBack]);
 
   return (
     <div className="flex min-h-screen bg-background text-foreground">
@@ -217,6 +355,15 @@ export default function App() {
                   >
                     <Square className="h-3 w-3" />
                   </button>
+                  <button
+                    onClick={() => restartJob(j.id)}
+                    disabled={restartingId === j.id}
+                    title={`Restart ${j.title} (stop + start again)`}
+                    aria-label={`Restart ${j.title}`}
+                    className="shrink-0 rounded p-1 text-muted-foreground opacity-60 hover:bg-accent hover:text-foreground hover:opacity-100 disabled:opacity-40"
+                  >
+                    <RotateCcw className={`h-3 w-3 ${restartingId === j.id ? "animate-spin" : ""}`} />
+                  </button>
                 </div>
               ))}
             </div>
@@ -278,6 +425,24 @@ export default function App() {
               >
                 {dark ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
               </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => setPortalConfirm("restart")}
+                disabled={portalBusy !== null}
+                title="Restart the admin portal api (respawns node server/index.js on port 4102)"
+              >
+                <RotateCcw className="h-3.5 w-3.5" /> Restart portal
+              </Button>
+              <Button
+                size="sm"
+                variant="destructive-outline"
+                onClick={() => setPortalConfirm("stop")}
+                disabled={portalBusy !== null}
+                title="Stop the admin portal api (needs a manual restart)"
+              >
+                <Power className="h-3.5 w-3.5" /> Stop portal
+              </Button>
             </div>
           </header>
 
@@ -288,7 +453,7 @@ export default function App() {
               <AlertDescription className="mt-1 flex flex-col gap-3">
                 <span>
                   Vite is running but nothing answers <code className="font-mono">/api/*</code> on
-                  port 3111 (ECONNREFUSED). Start the backend, then retry:
+                  port 4102 (ECONNREFUSED). Start the backend, then retry:
                   <code className="mx-1 rounded bg-muted px-1 py-0.5 font-mono text-xs">
                     cd admin && npm run dev
                   </code>
@@ -303,6 +468,48 @@ export default function App() {
                     <RefreshCw className="h-3.5 w-3.5" /> Retry connection
                   </Button>
                 </span>
+              </AlertDescription>
+            </Alert>
+          )}
+
+          {portalNotice && (
+            <Alert
+              variant={
+                portalNotice.kind === "error" || portalNotice.kind === "stopped" ? "error" : "warning"
+              }
+              className="mb-6"
+            >
+              {portalNotice.kind === "restarting" ? (
+                <RefreshCw className="h-4 w-4 animate-spin" />
+              ) : (
+                <ServerOff className="h-4 w-4" />
+              )}
+              <AlertTitle>
+                {portalNotice.kind === "restarting"
+                  ? "Restarting admin portal…"
+                  : portalNotice.kind === "restarted"
+                    ? "Admin portal restarted"
+                    : portalNotice.kind === "stopped"
+                      ? "Admin portal stopped"
+                      : "Portal action failed"}
+              </AlertTitle>
+              <AlertDescription className="mt-1 flex flex-col gap-3">
+                <span>{portalNotice.text}</span>
+                {(portalNotice.kind === "restarted" || portalNotice.kind === "error") && (
+                  <span>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => {
+                        setPortalNotice(null);
+                        loadInitial();
+                        refreshJobs();
+                      }}
+                    >
+                      <RefreshCw className="h-3.5 w-3.5" /> Refresh
+                    </Button>
+                  </span>
+                )}
               </AlertDescription>
             </Alert>
           )}
@@ -397,7 +604,7 @@ export default function App() {
                 env={env}
                 loading={envLoading}
                 error={envError}
-                onRetry={loadInitial}
+                onRetry={refreshEnv}
                 onJobStarted={(jobId) => {
                   setActiveJobId(jobId);
                   refreshJobs();
@@ -449,14 +656,66 @@ export default function App() {
                             <Square className="h-3 w-3" />
                           </button>
                         )}
+                        <button
+                          onClick={() => restartJob(j.id)}
+                          disabled={restartingId === j.id}
+                          title={j.status === "running" ? `Restart ${j.title} (stop + start again)` : `Run ${j.title} again`}
+                          aria-label={`Restart ${j.title}`}
+                          className="shrink-0 rounded p-1 text-muted-foreground opacity-60 hover:bg-accent hover:text-foreground hover:opacity-100 disabled:opacity-40"
+                        >
+                          <RotateCcw className={`h-3 w-3 ${restartingId === j.id ? "animate-spin" : ""}`} />
+                        </button>
                       </div>
                     ))}
                   </div>
                 </ScrollArea>
-                <JobTerminal jobId={activeJobId} jobs={jobs} onKill={refreshJobs} />
+                <JobTerminal
+                  jobId={activeJobId}
+                  jobs={jobs}
+                  onKill={refreshJobs}
+                  onRestarted={(newJobId) => {
+                    setActiveJobId(newJobId);
+                    refreshJobs();
+                  }}
+                />
               </div>
             </TabsContent>
           </Tabs>
+
+          <Dialog open={portalConfirm !== null} onOpenChange={(open) => !open && setPortalConfirm(null)}>
+            <DialogContent className="sm:max-w-md">
+              <DialogHeader>
+                <DialogTitle>
+                  {portalConfirm === "restart" ? "Restart admin portal?" : "Stop admin portal?"}
+                </DialogTitle>
+                <DialogDescription>
+                  {portalConfirm === "restart"
+                    ? "The admin api (node server/index.js on port 4102) will respawn. Running jobs are stopped first. The page reconnects automatically once it is back."
+                    : "The admin api (node server/index.js on port 4102) will exit and this panel will go offline. Running jobs are stopped first. You will need to restart it manually: cd admin && npm run dev."}
+                </DialogDescription>
+              </DialogHeader>
+              <DialogFooter>
+                <Button variant="outline" onClick={() => setPortalConfirm(null)} disabled={portalBusy !== null}>
+                  Cancel
+                </Button>
+                <Button
+                  variant={portalConfirm === "stop" ? "destructive" : "default"}
+                  onClick={confirmPortalAction}
+                  disabled={portalBusy !== null}
+                >
+                  {portalConfirm === "restart" ? (
+                    <>
+                      <RotateCcw className="h-4 w-4" /> Restart
+                    </>
+                  ) : (
+                    <>
+                      <Power className="h-4 w-4" /> Stop
+                    </>
+                  )}
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
         </div>
       </main>
     </div>

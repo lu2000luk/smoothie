@@ -3,7 +3,7 @@ import type { Action, RunRequest, EnvInfo, JobInfo, RuntimeConfig, RuntimeOverri
 export class BackendUnreachableError extends Error {
   constructor() {
     super(
-      "Admin API server is not reachable (http://localhost:3111). Run `npm run dev` in admin/ (starts web + api) or `node server/index.js` alongside Vite."
+      "Admin API server is not reachable (http://localhost:4102). Run `npm run dev` in admin/ (starts web + api) or `node server/index.js` alongside Vite."
     );
     this.name = "BackendUnreachableError";
   }
@@ -34,14 +34,16 @@ async function fetchJson<T>(input: string, init?: RequestInit): Promise<T> {
   let res: Response;
   try {
     res = await fetch(input, init);
-  } catch {
+  } catch (err) {
+    if ((err as Error)?.name === "AbortError") throw err;
     throw new BackendUnreachableError();
   }
   return json<T>(res);
 }
 
 export const api = {
-  env: () => fetchJson<EnvInfo>("/api/env"),
+  env: (opts?: { fresh?: boolean; signal?: AbortSignal }) =>
+    fetchJson<EnvInfo>(opts?.fresh ? "/api/env?fresh=1" : "/api/env", opts?.signal ? { signal: opts.signal } : undefined),
 
   actions: () => fetchJson<Action[]>("/api/actions"),
 
@@ -94,6 +96,18 @@ export const api = {
   /** Stop a (long-)running action by action id — no job id needed. */
   stop: (actionId: string) =>
     fetchJson<{ ok: boolean; jobIds: string[] }>(`/api/stop/${encodeURIComponent(actionId)}`, { method: "POST" }),
+
+  /** Restart a job: stops it (if running) and starts a new job with the same spec. */
+  restart: (jobId: string) =>
+    fetchJson<{ ok: boolean; jobId: string }>(`/api/restart/${jobId}`, { method: "POST" }),
+
+  /** Stop the admin portal api process itself. */
+  stopPortal: () =>
+    fetchJson<{ ok: boolean; stopped: boolean }>("/api/portal/stop", { method: "POST" }),
+
+  /** Restart the admin portal api (detached replacement + self-exit). */
+  restartPortal: () =>
+    fetchJson<{ ok: boolean; restarting: boolean }>("/api/portal/restart", { method: "POST" }),
 
   /** SSE stream of job logs; returns an EventSource */
   stream: (jobId: string, handlers: {

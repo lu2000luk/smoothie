@@ -46,6 +46,10 @@ const crossBuildSteps = (crate) => [
  */
 const startDbSteps = [
   {
+    cmd: `${DOCKER} rm -f smoothie-dragonfly || echo already-clean`,
+    note: "Remove any stale container with the same name (idempotent — succeeds whether or not it exists).",
+  },
+  {
     cmd: `${DOCKER} run -d --name smoothie-dragonfly -p 6379:6379 --ulimit memlock=-1 docker.dragonflydb.io/dragonflydb/dragonfly`,
     note: "Start DragonflyDB (redis-compatible) detached on port 6379. Uses -p port mapping so it works identically on WSL and Linux.",
   },
@@ -57,6 +61,10 @@ const startDbSteps = [
 
 /** MinIO S3 — same command as hypervisor/Justfile, detached for convenience. */
 const startS3Steps = [
+  {
+    cmd: `${DOCKER} rm -f smoothie-minio || echo already-clean`,
+    note: "Remove any stale container with the same name (idempotent — succeeds whether or not it exists).",
+  },
   {
     cmd: `${DOCKER} run -d --name smoothie-minio -p 9000:9000 -p 9001:9001 -e MINIO_ROOT_USER={accessKey} -e MINIO_ROOT_PASSWORD={secretKey} minio/minio server /data --console-address ":9001"`,
     note: "Start MinIO detached: API on :9000, web console on :9001 (login with the credentials below).",
@@ -241,11 +249,15 @@ export const actions = [
     group: "services",
     steps: [
       {
+        cmd: `test -f "{tmpDir}/{tarName}" || (echo "missing package {tmpDir}/{tarName} — run \\u201cPackage example app\\u201d first" && exit 1)`,
+        note: "Guards that the package tar exists (clear error instead of mc 'path not found').",
+      },
+      {
         cmd: `${DOCKER} run --rm --network=host -e MC_HOST_local=http://{accessKey}:{secretKey}@127.0.0.1:9000 minio/mc mb --ignore-existing local/{bucket}`,
         note: "Creates the bucket (ignored if it already exists). Runs inside a throwaway minio/mc container that talks to MinIO over the host network.",
       },
       {
-        cmd: `${DOCKER} run --rm --network=host -e MC_HOST_local=http://{accessKey}:{secretKey}@127.0.0.1:9000 -v {tmpDir}:/pkg minio/mc cp /pkg/{tarName} local/{bucket}/{tarName}`,
+        cmd: `${DOCKER} run --rm --network=host -e MC_HOST_local=http://{accessKey}:{secretKey}@127.0.0.1:9000 -v "{tmpDir}:/pkg" minio/mc cp /pkg/{tarName} local/{bucket}/{tarName}`,
         note: "Uploads the built package to the bucket via a throwaway minio/mc container with {tmpDir} mounted at /pkg.",
       },
     ],
@@ -283,7 +295,7 @@ export const actions = [
         cwd: "hypervisor",
         note: "Sanity check: hypervisor refuses to boot without config.json.",
       },
-      { cmd: "cargo run --release", cwd: "hypervisor", note: "Starts the hypervisor (stays running; stop it from the Jobs panel)." },
+      { cmd: "cargo run --release", cwd: "hypervisor", note: "Starts the hypervisor (stays running; stop via its Stop button, the Stop-hypervisor action, or the Jobs panel)." },
     ],
   },
   {
@@ -292,7 +304,7 @@ export const actions = [
     description: "Runs the router with cargo run (release). Keeps running until you stop it.",
     group: "run",
     longRunning: true,
-    steps: [{ cmd: "cargo run --release", cwd: "router", note: "Starts the router (stays running; stop it from the Jobs panel)." }],
+    steps: [{ cmd: "cargo run --release", cwd: "router", note: "Starts the router (stays running; stop via its Stop button, the Stop-router action, or the Jobs panel)." }],
   },
   {
     id: "start-ui",
@@ -308,6 +320,45 @@ export const actions = [
       },
     ],
   },
+  {
+    id: "stop-hypervisor",
+    title: "Stop hypervisor",
+    description:
+      "Stops the hypervisor: kills the tracked job (if running) plus any orphan hypervisor processes (release binary or cargo run wrapper). Safe to run when nothing is running.",
+    group: "run",
+    steps: [
+      {
+        cmd: `pkill -f "target/.*/release/hypervisor" 2>/dev/null; pkill -f "cargo run.*hypervisor" 2>/dev/null; pkill -f "release/hypervisor" 2>/dev/null; sleep 1; pgrep -af "release/hypervisor|cargo run" 2>/dev/null | grep -i hypervisor || echo "hypervisor stopped (no remaining processes)"`,
+        note: "Kills hypervisor processes by pattern (binary + cargo wrapper), then verifies nothing matching remains. The server also stops the tracked Start-hypervisor job.",
+      },
+    ],
+  },
+  {
+    id: "stop-router",
+    title: "Stop router",
+    description:
+      "Stops the router: kills the tracked job (if running) plus any orphan router processes (release binary or cargo run wrapper). Safe to run when nothing is running.",
+    group: "run",
+    steps: [
+      {
+        cmd: `pkill -f "target/.*/release/router" 2>/dev/null; pkill -f "cargo run.*router" 2>/dev/null; pkill -f "release/router" 2>/dev/null; sleep 1; pgrep -af "release/router|cargo run" 2>/dev/null | grep -i router || echo "router stopped (no remaining processes)"`,
+        note: "Kills router processes by pattern (binary + cargo wrapper), then verifies nothing matching remains. The server also stops the tracked Start-router job.",
+      },
+    ],
+  },
+  {
+    id: "stop-ui",
+    title: "Stop ui (dev server)",
+    description:
+      "Stops the SvelteKit ui dev server: kills the tracked job (if running) plus any orphan vite dev / svelte-kit processes and frees port 5173. Safe to run when nothing is running.",
+    group: "run",
+    steps: [
+      {
+        cmd: `pkill -f "vite dev" 2>/dev/null; pkill -f "svelte-kit" 2>/dev/null; (command -v fuser >/dev/null 2>&1 && fuser -k 5173/tcp 2>/dev/null || true); sleep 1; pgrep -af "vite dev" 2>/dev/null || echo "ui dev server stopped (no remaining processes)"`,
+        note: "Kills vite dev / svelte-kit processes ('vite dev' targets the ui server, not the admin panel which runs plain 'vite' on :5174) and frees :5173. The server also stops the tracked Start-ui job.",
+      },
+    ],
+  },
 
   // ─── package ───────────────────────────────────────────────────
   {
@@ -319,7 +370,7 @@ export const actions = [
     steps: [
       { cmd: "cargo build --release", cwd: "example_app", note: "Compile the example HTTP app." },
       {
-        cmd: `BIN=$(ls target/${CROSS_TARGET}/release/example_app target/release/example_app 2>/dev/null | head -1); test -n "$BIN" || (echo "no built binary found (looked for cross + native target dirs)" && exit 1); mkdir -p /tmp/smoothie-pkg && cp "$BIN" /tmp/smoothie-pkg/main && tar -cf /tmp/smoothie-pkg/example_app.tar -C /tmp/smoothie-pkg main && rm /tmp/smoothie-pkg/main && echo "Package: /tmp/smoothie-pkg/example_app.tar"`,
+        cmd: `BIN=$(ls target/${CROSS_TARGET}/release/example_app target/release/example_app 2>/dev/null | head -1); test -n "$BIN" || (echo "no built binary found (looked for cross + native target dirs)" && exit 1); mkdir -p "{tmpDir}" && cp "$BIN" "{tmpDir}/main" && tar -cf "{tmpDir}/{tarName}" -C "{tmpDir}" main && rm "{tmpDir}/main" && echo "Package: {tmpDir}/{tarName}"`,
         cwd: "example_app",
         note: "Renames the binary to `main` and tars it — matches the .tar package format (main = entrypoint). Picks the Windows cross-built binary when present, else the native one.",
       },

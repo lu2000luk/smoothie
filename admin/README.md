@@ -10,6 +10,7 @@ one-click actions:
 - **Prefill S3** — creates the bucket and uploads a packaged example app
 - **Package example app** — builds + tars the example app (`main` entrypoint)
 - **Start hypervisor / router / ui** — long-running jobs with live terminal
+- **Stop hypervisor / router / ui** — kills the tracked job plus orphan processes
 - **Config generator** — writes `hypervisor/config.json` with a validated JSON preview
 - **Environment check** — probes cargo, docker, node, bun, just… and reports versions
 
@@ -33,15 +34,15 @@ On Windows the server detects the platform and WSL availability:
 cd admin
 npm install
 
-# dev mode: API on :3111 + Vite dev server on :5174 (hot reload)
+# dev mode: API on :4102 + Vite dev server on :5174 (hot reload)
 npm run dev:server &
 npm run dev
 
-# or production mode: build once, serve everything from :3111
+# or production mode: build once, serve everything from :4102
 npm start
 ```
 
-Then open http://localhost:3111 (prod) or http://localhost:5174 (dev).
+Then open http://localhost:4102 (prod) or http://localhost:5174 (dev).
 
 ## Architecture
 
@@ -63,7 +64,8 @@ admin/
   (params substituted, WSL wrapping applied) without executing anything
 - **Jobs**: `POST /api/run` spawns the steps sequentially, `GET /api/stream/:job`
   replays + streams stdout/stderr over SSE, `POST /api/kill/:job` kills the
-  whole process group
+  whole process group, `POST /api/stop/:actionId` stops a long-running action
+  by id (also triggered automatically when a Stop-* action runs)
 - **Param safety**: substitutions are validated against a strict charset so
   values can't break out of their placeholder
 - **Long-running protection**: only one instance of a long-running action

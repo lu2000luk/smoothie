@@ -14,7 +14,7 @@ export default defineConfig({
     port: 5174,
     proxy: {
       "/api": {
-        target: "http://localhost:3111",
+        target: `http://localhost:${process.env.ADMIN_PORT || 4102}`,
         changeOrigin: true,
       },
     },

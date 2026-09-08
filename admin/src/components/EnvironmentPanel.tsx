@@ -15,9 +15,9 @@ const TOOL_NOTES: Record<string, string> = {
   cargo: "Rust package manager — builds hypervisor, router and example_app",
   docker: "Container engine used by the hypervisor and the service actions",
   podman: "Docker-compatible alternative (checked when docker is missing)",
-  node: "Node.js runtime for the ui and admin panel servers",
-  npm: "Node package manager (bun is preferred when present)",
-  bun: "Faster alternative to npm used by the ui",
+  node: "Node.js runtime for the ui and admin panel servers (probed natively on Windows)",
+  npm: "Node package manager (bun is preferred when present; probed natively on Windows)",
+  bun: "Faster alternative to npm used by the ui (probed natively on Windows)",
   just: "Command runner used by the project Justfiles (optional)",
   rustc: "Rust compiler",
 };
@@ -39,9 +39,16 @@ export function EnvironmentPanel({ env, loading, error, onRetry, onJobStarted }:
 
   if (loading && !env) {
     return (
-      <p className="flex items-center gap-2 text-sm text-muted-foreground">
-        <Spinner className="h-4 w-4" /> Detecting environment…
-      </p>
+      <div className="flex items-center gap-3 text-sm text-muted-foreground">
+        <p className="flex items-center gap-2">
+          <Spinner className="h-4 w-4" /> Detecting environment…
+        </p>
+        {onRetry && (
+          <Button size="xs" variant="outline" onClick={onRetry} title="Restart the environment probe">
+            <RefreshCw className="h-3 w-3" /> Re-check
+          </Button>
+        )}
+      </div>
     );
   }
 
@@ -298,15 +305,20 @@ export function EnvironmentPanel({ env, loading, error, onRetry, onJobStarted }:
               <TerminalSquare className="h-4 w-4" /> Toolchain
             </CardTitle>
             {onRetry && (
-              <Button size="xs" variant="outline" onClick={onRetry} disabled={!!loading}>
+              <Button
+                size="xs"
+                variant="outline"
+                onClick={onRetry}
+                title={loading ? "Re-check is running — click to restart the probe" : "Re-check toolchain"}
+              >
                 {loading ? <Spinner className="h-3 w-3" /> : <RefreshCw className="h-3 w-3" />}
-                Re-check
+                {loading ? "Checking…" : "Re-check"}
               </Button>
             )}
           </div>
           <CardDescription>
             {env.useWsl
-              ? `Probed inside the default WSL distro${distroLabel ? ` · ${distroLabel}` : ""}`
+              ? `Probed inside the default WSL distro${distroLabel ? ` · ${distroLabel}` : ""} (node / npm / bun run natively on Windows, so those three are probed on Windows instead)`
               : `Probed on the machine running the admin server${distroLabel ? ` · ${distroLabel}` : ""}`}
           </CardDescription>
         </CardHeader>

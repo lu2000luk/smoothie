@@ -1,6 +1,7 @@
 import express from "express";
 import path from "node:path";
 import fs from "node:fs";
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { actions, getAction } from "./actions.js";
 import {
@@ -28,27 +29,56 @@ const app = express();
 const runner = new JobRunner();
 
 const CONFIG_PATH = path.join(PROJECT_ROOT, "hypervisor", "config.json");
-const PKG_DIR = "/tmp/smoothie-pkg";
-const PKG_TAR = "example_app.tar";
 
 app.use(express.json());
 
 /* ─── environment detection ─────────────────────────────────────── */
 
-app.get("/api/env", async (_req, res) => {
-  const wsl = await detectWsl();
-  const useWsl = runtime.isWindows && wsl.available;
-  const [tools, distro, native] = await Promise.all([
-    detectTools(useWsl),
-    detectDistro(useWsl),
-    detectWindowsNative(),
-  ]);
+// Short-lived cache: React StrictMode (dev) mounts effects twice, which
+// fired two full WSL probe sweeps back-to-back and kept the UI in
+// "loading" with Re-check disabled. Re-check bypasses via ?fresh=1.
+let envCache = { at: 0, payload: null };
+const ENV_CACHE_TTL_MS = 8000;
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((resolve) =>
+    (timer = setTimeout(() => resolve({ __timeout: true, label }), ms))
+  );
+  return Promise.race([promise.then((v) => ({ __timeout: false, value: v })), timeout]).finally(() =>
+    clearTimeout(timer)
+  );
+}
+
+app.get("/api/env", async (req, res) => {
+  try {
+    const fresh = req.query.fresh === "1";
+    if (!fresh && envCache.payload && Date.now() - envCache.at < ENV_CACHE_TTL_MS) {
+      return res.json(envCache.payload);
+    }
+    const wsl = await detectWsl();
+    const useWsl = runtime.isWindows && wsl.available;
+    const [toolsRes, distroRes, nativeRes] = await Promise.all([
+      withTimeout(detectTools(useWsl), 20000, "tools"),
+      withTimeout(detectDistro(useWsl), 18000, "distro"),
+      withTimeout(detectWindowsNative(), 12000, "native"),
+    ]);
+    const tools = toolsRes.__timeout ? {} : toolsRes.value;
+    const distro = distroRes.__timeout
+      ? { id: "unknown", family: "unknown", pretty: "Detection timed out", version: "", supported: false }
+      : distroRes.value;
+    const native = nativeRes.__timeout
+      ? { docker: { available: false }, cargo: { available: false }, zig: { available: false } }
+      : nativeRes.value;
+    if (toolsRes.__timeout) {
+      console.warn("GET /api/env: tool detection timed out after 20s — returning partial env");
+    }
   const installs = {};
   for (const name of Object.keys(tools)) {
     installs[name] = getInstallRecipe(name, distro);
   }
   const runtimeCfg = getRuntimeConfig();
-  res.json({
+  const payload = {
     platform: process.platform,
     isWindows: runtime.isWindows,
     wslAvailable: wsl.available,
@@ -69,7 +99,13 @@ app.get("/api/env", async (_req, res) => {
       : "wsl",
     buildMode: runtimeCfg.buildMode,
     crossTarget: CROSS_TARGET,
-  });
+  };
+  envCache = { at: Date.now(), payload };
+  res.json(payload);
+  } catch (err) {
+    console.error(`GET /api/env failed: ${err?.message ?? err}`);
+    res.status(500).json({ error: `Environment detection failed: ${err?.message ?? err}` });
+  }
 });
 
 /* ─── runtime prefs (Windows: Docker Desktop vs WSL, cross-compile) ─── */
@@ -211,10 +247,28 @@ app.post("/api/preview", async (req, res) => {
 
 /* ─── run / kill / jobs / logs ──────────────────────────────────── */
 
+/**
+ * Stop actions also terminate the matching tracked long-running job
+ * (shell pkill alone can't reach it: the tracked proc is the wsl.exe /
+ * cmd.exe wrapper, while the real server binary lives inside WSL or in a
+ * child process group). Killed first so the cleanup step below can verify
+ * a quiet system; orphans are caught by the pkill patterns in actions.js.
+ */
+const STOP_TARGETS = {
+  "stop-hypervisor": "start-hypervisor",
+  "stop-router": "start-router",
+  "stop-ui": "start-ui",
+};
+
 app.post("/api/run", async (req, res) => {
   const { actionId, params = {}, runtime: runtimeOverride } = req.body ?? {};
   const action = getAction(actionId);
   if (!action) return res.status(404).json({ error: `Unknown action: ${actionId}` });
+
+  // Running a Stop-* action first kills the tracked Start-* job (if any).
+  // Never 409s: stopping when nothing runs is fine (shell step reports it).
+  const stopTarget = STOP_TARGETS[actionId];
+  if (stopTarget) runner.killAction(stopTarget);
 
   // Refuse to run two long-running actions of the same id simultaneously
   if (action.longRunning) {
@@ -274,6 +328,20 @@ app.post("/api/stop/:actionId", (req, res) => {
     return res.status(409).json({ error: `"${req.params.actionId}" is not running` });
   }
   res.json({ ok: true, jobIds });
+});
+
+/**
+ * Restart a job by id: stops it (if running) and starts a new job with the
+ * same action spec. Returns the replacement job id. Used by the Run-jobs
+ * Restart buttons (hypervisor / router / ui keep running until stopped, so
+ * a one-click stop + start again is the common operation).
+ */
+app.post("/api/restart/:jobId", async (req, res) => {
+  const job = runner.getJob(req.params.jobId);
+  if (!job) return res.status(404).json({ error: "Unknown job" });
+  const jobId = await runner.restart(req.params.jobId);
+  if (!jobId) return res.status(400).json({ error: `Job "${req.params.jobId}" cannot be restarted` });
+  res.json({ ok: true, jobId });
 });
 
 app.get("/api/jobs", (_req, res) => {
@@ -357,6 +425,65 @@ app.post("/api/config", (req, res) => {
   }
 });
 
+/* ─── admin portal self-management (stop / restart) ─────────────── */
+
+function stopTrackedJobs() {
+  for (const job of runner.jobs.values()) {
+    if (job.status === "running") runner.kill(job.id);
+  }
+}
+
+/**
+ * Exit the portal process. `server.close()` first frees port 4102 so a
+ * restart replacement can bind immediately (no EADDRINUSE race).
+ * Exit code matters in dev (`concurrently --kill-others-on-fail`):
+ *   Stop → exit 1 → vite is torn down too (full portal stop).
+ *   Restart → exit 0 → vite survives, only the api process is replaced.
+ */
+function exitPortal(code) {
+  stopTrackedJobs();
+  try {
+    server.close(() => process.exit(code));
+    setTimeout(() => process.exit(code), 1500);
+  } catch {
+    setTimeout(() => process.exit(code), 200);
+  }
+}
+
+/** Stop the admin portal (this api process). Frontend shows a "stopped" state. */
+app.post("/api/portal/stop", (_req, res) => {
+  res.json({ ok: true, stopped: true });
+  setTimeout(() => exitPortal(1), 250);
+});
+
+/**
+ * Restart the admin portal api: spawn a detached replacement
+ * (`node server/index.js` with the same args) then exit this process.
+ * In production (`npm start`, single process serving dist/) the portal
+ * comes back on the same port. In dev the vite process survives
+ * (exit 0 + --kill-others-on-fail) and its /api proxy reconnects.
+ */
+app.post("/api/portal/restart", (_req, res) => {
+  res.json({ ok: true, restarting: true });
+  setTimeout(() => {
+    try {
+      const entry = path.join(__dirname, "index.js");
+      const args = process.argv.slice(2);
+      const child = spawn(process.execPath, [entry, ...args], {
+        detached: true,
+        stdio: "ignore",
+        cwd: path.join(__dirname, ".."),
+        env: process.env,
+      });
+      child.unref();
+    } catch (err) {
+      console.error(`portal restart: failed to spawn replacement: ${err.message}`);
+      return;
+    }
+    exitPortal(0);
+  }, 250);
+});
+
 /* ─── static frontend (production) ──────────────────────────────── */
 
 const DIST = path.join(__dirname, "..", "dist");
@@ -367,8 +494,8 @@ app.get(/^\/(?!api|stream).*/, (_req, res) => {
 
 /* ─── boot ──────────────────────────────────────────────────────── */
 
-const PORT = process.env.ADMIN_PORT || 3111;
-app.listen(PORT, () => {
+const PORT = process.env.ADMIN_PORT || 4102;
+const server = app.listen(PORT, () => {
   console.log(`Smoothie admin server → http://localhost:${PORT}`);
   console.log(`Project root: ${PROJECT_ROOT}`);
   if (runtime.isWindows) {

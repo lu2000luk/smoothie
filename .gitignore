@@ -1,2 +1,4 @@
 /target
+/.tmp/
 opencode.json
+zen_launch.py

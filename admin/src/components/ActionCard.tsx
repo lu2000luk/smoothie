@@ -15,7 +15,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { TerminalSquare, Info, Loader2, Zap, Square, Eye } from "lucide-react";
+import { TerminalSquare, Info, Loader2, Zap, Square, Eye, RotateCcw } from "lucide-react";
 
 export function ActionCard({
   action,
@@ -38,6 +38,7 @@ export function ActionCard({
   const [previewing, setPreviewing] = useState(false);
   const [running, setRunning] = useState(false);
   const [stopping, setStopping] = useState(false);
+  const [restarting, setRestarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // Per-run Windows execution overrides. "global" follows the stored prefs.
   const [dockerSel, setDockerSel] = useState<DockerEngineSetting | "global">("global");
@@ -117,6 +118,32 @@ export function ActionCard({
     }
   };
 
+  const restart = async () => {
+    setRestarting(true);
+    setError(null);
+    try {
+      // Stop the live job first (exact kill-by-job, fallback to stop-by-action),
+      // then start a fresh job with the same params + runtime overrides.
+      if (runningJob) {
+        try {
+          await api.kill(runningJob.id);
+        } catch {
+          await api.stop(action.id);
+        }
+        await new Promise((r) => setTimeout(r, 600));
+      }
+      const req: RunRequest = { actionId: action.id, params };
+      const override = toOverride();
+      if (Object.keys(override).length > 0) req.runtime = override;
+      const { jobId } = await api.run(req);
+      onStarted?.(jobId);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setRestarting(false);
+    }
+  };
+
   const showRuntimePickers = !!env?.isWindows;
   const isRunning = !!runningJob;
 
@@ -161,55 +188,82 @@ export function ActionCard({
               ))}
             </div>
           )}
-          <div className="flex items-center gap-2">
+          <div className="flex flex-col gap-2">
             {isRunning ? (
               <>
-                <Button
-                  size="sm"
-                  variant="destructive-outline"
-                  onClick={stop}
-                  disabled={stopping}
-                  className="flex-1"
-                  title={`Stop ${action.title}`}
-                >
-                  {stopping ? (
-                    <>
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" /> Stopping…
-                    </>
-                  ) : (
-                    <>
-                      <Square className="h-3.5 w-3.5" /> Stop
-                    </>
+                <div className="flex items-center gap-2">
+                  <Button
+                    size="sm"
+                    variant="destructive-outline"
+                    onClick={stop}
+                    disabled={stopping || restarting}
+                    className="flex-1"
+                    title={`Stop ${action.title}`}
+                  >
+                    {stopping ? (
+                      <>
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" /> Stopping…
+                      </>
+                    ) : (
+                      <>
+                        <Square className="h-3.5 w-3.5" /> Stop
+                      </>
+                    )}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={restart}
+                    disabled={restarting || stopping}
+                    className="flex-1"
+                    title={`Restart ${action.title} (stop + start again)`}
+                  >
+                    {restarting ? (
+                      <>
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" /> Restarting…
+                      </>
+                    ) : (
+                      <>
+                        <RotateCcw className="h-3.5 w-3.5" /> Restart
+                      </>
+                    )}
+                  </Button>
+                  {action.docsUrl && (
+                    <Button size="icon-sm" variant="ghost" render={<a href={action.docsUrl} target="_blank" rel="noreferrer" />}>
+                      <Info className="h-3.5 w-3.5" />
+                    </Button>
                   )}
-                </Button>
+                </div>
                 <Button
                   size="sm"
-                  variant="outline"
+                  variant="ghost"
                   onClick={() => runningJob && onViewLogs?.(runningJob.id)}
                   disabled={!runningJob}
-                  className="flex-1"
+                  className="w-full"
                   title="View live logs in the Jobs tab"
                 >
                   <Eye className="h-3.5 w-3.5" /> View logs
                 </Button>
               </>
             ) : (
-              <Button size="sm" onClick={openPreview} disabled={previewing} className="flex-1">
-                {previewing ? (
-                  <>
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" /> Building preview…
-                  </>
-                ) : (
-                  <>
-                    <TerminalSquare className="h-3.5 w-3.5" /> Preview &amp; run
-                  </>
+              <div className="flex items-center gap-2">
+                <Button size="sm" onClick={openPreview} disabled={previewing} className="flex-1">
+                  {previewing ? (
+                    <>
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" /> Building preview…
+                    </>
+                  ) : (
+                    <>
+                      <TerminalSquare className="h-3.5 w-3.5" /> Preview &amp; run
+                    </>
+                  )}
+                </Button>
+                {action.docsUrl && (
+                  <Button size="icon-sm" variant="ghost" render={<a href={action.docsUrl} target="_blank" rel="noreferrer" />}>
+                    <Info className="h-3.5 w-3.5" />
+                  </Button>
                 )}
-              </Button>
-            )}
-            {action.docsUrl && (
-              <Button size="icon-sm" variant="ghost" render={<a href={action.docsUrl} target="_blank" rel="noreferrer" />}>
-                <Info className="h-3.5 w-3.5" />
-              </Button>
+              </div>
             )}
           </div>
           {isRunning && runningJob && (

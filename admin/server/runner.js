@@ -79,14 +79,23 @@ export async function detectWsl() {
   if (!IS_WIN) return { available: false, distro: null, reason: "not-windows" };
   if (wslAvailability) return wslAvailability;
   const available = await new Promise((resolve) => {
+    let done = false;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(v);
+    };
     const p = spawn("wsl.exe", ["--status"], { windowsHide: true });
     let out = "";
     p.stdout.on("data", (d) => (out += d));
-    p.on("error", () => resolve(false));
-    p.on("close", (code) => resolve(code === 0 && /linux/i.test(out) || code === 0));
-    setTimeout(() => {
-      p.kill();
-      resolve(false);
+    p.on("error", () => finish(false));
+    p.on("close", (code) => finish(code === 0 && /linux/i.test(out) || code === 0));
+    const timer = setTimeout(() => {
+      try {
+        p.kill();
+      } catch { /* already exited */ }
+      finish(false);
     }, 5000);
   });
   wslAvailability = { available, distro: available ? WSL_DISTRO : null };
@@ -94,10 +103,20 @@ export async function detectWsl() {
 }
 
 /**
- * Commands that can run natively on Windows (they exist as .exe and don't
- * depend on a POSIX toolchain). Everything else goes through WSL.
+ * Commands that can run natively on Windows (they exist as .exe/.cmd and
+ * don't depend on a POSIX toolchain). Everything else goes through WSL.
  */
 const NATIVE_ON_WINDOWS = /^(node|npm|npx|bun|bunx|pnpm|yarn)(\s|$)/;
+
+/**
+ * Node-ecosystem fallback compounds used by the ui/admin actions, e.g.
+ * `(command -v bun >/dev/null 2>&1 && bun install) || npm install`.
+ * They only invoke node/npm/bun, so they can run natively on Windows
+ * (via cmd.exe after POSIX→cmd rewriting in buildPlan) instead of
+ * requiring a duplicate Node install inside WSL.
+ */
+const NATIVE_FALLBACK_COMPOUND =
+  /^\(command -v (bun|node|npm)\b.*\)\s*\|\|\s*(npm|bun|node|npx|bunx)\b/;
 
 /**
  * True when the command is a direct `docker`/`podman` invocation (the thing
@@ -142,6 +161,8 @@ export function needsWsl(cmd, overrides = {}) {
     const engine = overrides.dockerEngine ?? runtimeConfig.dockerEngine;
     return engine !== "windows";
   }
+  // Node-ecosystem bun/npm fallbacks run natively (rewritten for cmd.exe).
+  if (NATIVE_FALLBACK_COMPOUND.test(c)) return false;
   // Compound/subshell scripts use POSIX syntax -> WSL bash
   if (/^[(<{|&]/.test(c)) return true;
   if (NATIVE_ON_WINDOWS.test(c)) return false;
@@ -163,26 +184,41 @@ export function wslWrap(cmd) {
   return ["wsl", ...distroArg, "-e", "bash", "-lc", escaped].join(" ");
 }
 
-/** Probe a native Windows .exe (docker.exe, cargo.exe, zig.exe) via cmd.exe — no WSL. */
+/**
+ * Probe a native Windows tool (docker, cargo, zig, node, npm, bun, …) via
+ * cmd.exe — no WSL. `bin` is given without extension so cmd resolves it
+ * through PATHEXT (npm/node are often .cmd shims — e.g. nvm-windows,
+ * volta, vite-plus — not .exe, so a hardcoded `.exe` suffix misses them).
+ */
 function probeNative(bin, flag = "--version") {
   return new Promise((resolve) => {
-    const proc = spawn(`"${bin}.exe" ${flag}`, { shell: "cmd.exe", windowsHide: true });
+    let done = false;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(v);
+    };
+    const proc = spawn(`${bin} ${flag}`, { shell: "cmd.exe", windowsHide: true });
     let out = "";
+    let err = "";
     const timer = setTimeout(() => {
-      proc.kill();
-      resolve({ available: false });
+      try {
+        proc.kill();
+      } catch { /* already exited */ }
+      finish({ available: false });
     }, 6000);
     proc.stdout?.on("data", (d) => (out += d));
+    proc.stderr?.on("data", (d) => (err += d));
     proc.on("error", () => {
-      clearTimeout(timer);
-      resolve({ available: false });
+      finish({ available: false });
     });
     proc.on("close", (code) => {
-      clearTimeout(timer);
-      if (code === 0 && out.trim()) {
-        resolve({ available: true, version: out.trim().split("\n")[0].slice(0, 60) });
+      const combined = (out + "\n" + err).trim();
+      if (code === 0 && combined) {
+        finish({ available: true, version: combined.split("\n")[0].slice(0, 60) });
       } else {
-        resolve({ available: false });
+        finish({ available: false });
       }
     });
   });
@@ -221,7 +257,7 @@ export function toCrossBuildCmd(cmd) {
   const build = /--target[\s=]/.test(cmd)
     ? cmd.replace(/^cargo\s+build\b/, "cargo zigbuild")
     : cmd.replace(/^cargo\s+build\b/, "cargo zigbuild") + ` --target ${CROSS_TARGET}`;
-  const ensureTarget = `rustup target add ${CROSS_TARGET} >NUL 2>&1`;
+  const ensureTarget = `(rustup target list --installed 2>NUL | findstr /C:${CROSS_TARGET} >NUL 2>&1 || rustup target add ${CROSS_TARGET} >NUL 2>&1)`;
   const ensureZigbuild = `(cargo zigbuild --version >NUL 2>&1 || cargo install cargo-zigbuild)`;
   return `${ensureTarget} & ${ensureZigbuild} & ${build}`;
 }
@@ -234,7 +270,7 @@ export function toCrossBuildCmdSh(cmd) {
   const build = /--target[\s=]/.test(cmd)
     ? cmd.replace(/^cargo\s+build\b/, "cargo zigbuild")
     : cmd.replace(/^cargo\s+build\b/, "cargo zigbuild") + ` --target ${CROSS_TARGET}`;
-  return `rustup target add ${CROSS_TARGET} >/dev/null 2>&1; (cargo zigbuild --version >/dev/null 2>&1 || cargo install cargo-zigbuild); ${build}`;
+  return `rustup target list --installed 2>/dev/null | grep -q ${CROSS_TARGET} || rustup target add ${CROSS_TARGET} >/dev/null 2>&1; (cargo zigbuild --version >/dev/null 2>&1 || cargo install cargo-zigbuild); ${build}`;
 }
 
 /**
@@ -250,6 +286,18 @@ export function toCrossRunCmd(cmd, cwdRel) {
   const rest = inner.replace(/--release\b/, "").trim();
   return [`./target/${CROSS_TARGET}/release/${bin}`, rest].filter(Boolean).join(" ");
 }
+
+/**
+ * Shared package staging dir — lives INSIDE the project so it is visible
+ * from Windows (native Docker Desktop), WSL (via /mnt/c/…) and native
+ * Linux at the same time. The old `/tmp/smoothie-pkg` split-brain put the
+ * tar in WSL's /tmp (invisible to Docker Desktop) so `mc cp /pkg/*.tar`
+ * failed with "Requested path not found".
+ */
+export const PKG_DIR_ABS = path.join(PROJECT_ROOT, ".tmp", "smoothie-pkg");
+export const PKG_TAR = "example_app.tar";
+/** Legacy location kept for backward-compat rewriting (see buildPlan). */
+export const LEGACY_PKG_DIR = "/tmp/smoothie-pkg";
 
 /**
  * Build the execution plan for a list of steps.
@@ -305,6 +353,52 @@ export function buildPlan(steps, overrides = {}) {
       cmd = toCrossRunCmd(cmd, relCwd);
       note = note ? `${note} [runs Windows cross-built Linux binary in WSL]` : `Runs the Windows cross-built Linux binary (${CROSS_TARGET}) inside WSL — no rebuild.`;
       useWsl = true;
+    } else if (IS_WIN && NATIVE_FALLBACK_COMPOUND.test(cmd.trim())) {
+      // Node-ecosystem fallback compounds run natively on Windows.
+      useWsl = false;
+      nativeWindows = true;
+    }
+
+    // POSIX → cmd.exe rewrite for natively-run Node fallback compounds:
+    // `command -v` → `where`, `/dev/null` → `NUL`. cmd.exe supports the
+    // same `( … ) || …` grouping and `&&`/`||` chaining used here.
+    if (IS_WIN && nativeWindows && NATIVE_FALLBACK_COMPOUND.test(cmd.trim())) {
+      cmd = cmd.replace(/command -v/g, "where").replace(/\/dev\/null/g, "NUL");
+    }
+
+    // ── shared pkg-dir translation (Windows split-brain fix) ──
+    // {tmpDir} is a project-relative staging dir (forward-slash form, e.g.
+    // `C:/…/smoothie/.tmp/smoothie-pkg`). WSL bash needs the /mnt/c/… view,
+    // native Docker Desktop needs the Windows view. Rewrite per execution
+    // target; also rewrite the legacy /tmp/smoothie-pkg so old preview URLs
+    // and hardcoded scripts keep working.
+    if (IS_WIN) {
+      const winSlash = PKG_DIR_ABS.replace(/\\/g, "/");
+      const winBack = PKG_DIR_ABS;
+      const wslPkg = toWslPath(PKG_DIR_ABS);
+      if (useWsl) {
+        if (scope === "docker") {
+          // Docker via WSL still talks to the Docker Desktop daemon (Windows),
+          // so `-v` must keep the Windows `C:/…` form — /mnt/c/… is unknown
+          // to the daemon. Only map the legacy /tmp path to the shared dir.
+          if (cmd.includes("\\")) cmd = cmd.split(winBack).join(winSlash);
+          if (cmd.includes(LEGACY_PKG_DIR)) cmd = cmd.split(LEGACY_PKG_DIR).join(winSlash);
+        } else {
+          cmd = cmd.split(winBack).join(wslPkg).split(winSlash).join(wslPkg);
+          if (cmd.includes(LEGACY_PKG_DIR)) cmd = cmd.split(LEGACY_PKG_DIR).join(wslPkg);
+        }
+      } else {
+        // Native Windows (cmd.exe / Docker Desktop): normalize backslashes
+        // to forward slashes for `docker -v`, and map legacy /tmp path.
+        if (cmd.includes("\\")) cmd = cmd.split(winBack).join(winSlash);
+        if (cmd.includes(LEGACY_PKG_DIR)) cmd = cmd.split(LEGACY_PKG_DIR).join(winSlash);
+        // Docker Desktop has no --network=host: mc must reach MinIO via
+        // host.docker.internal instead of 127.0.0.1.
+        if (scope === "docker" && cmd.includes("minio/mc")) {
+          cmd = cmd.replace(/\s--network=host\b/, "");
+          cmd = cmd.replace(/127\.0\.0\.1:9000/g, "host.docker.internal:9000");
+        }
+      }
     }
 
     let wslCwd = relCwd;
@@ -328,14 +422,15 @@ export function buildPlan(steps, overrides = {}) {
 /**
  * Runtime-computed params, always merged into user params at
  * preview/run time: {tmpDir}, {tarName}, {pkgDir}.
- * These paths are consumed inside bash (native or WSL) so they are
- * always POSIX-style — matches package-example which tars to /tmp.
+ * Forward-slash form so the same value is valid in bash, cmd.exe and
+ * `docker -v` (Docker Desktop accepts `C:/…` as well as `C:\…`).
  */
 export function runtimeParams() {
+  const dir = PKG_DIR_ABS.replace(/\\/g, "/");
   return {
-    tmpDir: "/tmp/smoothie-pkg",
-    tarName: "example_app.tar",
-    pkgDir: "/tmp/smoothie-pkg",
+    tmpDir: dir,
+    tarName: PKG_TAR,
+    pkgDir: dir,
   };
 }
 
@@ -349,7 +444,7 @@ export function substituteParams(text, params) {
     const val = params?.[key];
     if (val === undefined || val === null) return match;
     const strVal = String(val);
-    if (!/^[\w .:@/=+~\-]+$/.test(strVal)) {
+    if (!/^[\w .:@/=+~\\\-]+$/.test(strVal)) {
       throw new Error(`Parameter "${key}" contains unsupported characters: ${strVal}`);
     }
     return strVal;
@@ -377,7 +472,7 @@ export class JobRunner {
     return [...this.jobs.values()]
       .sort((a, b) => b.startedAt - a.startedAt)
       .slice(0, 50)
-      .map(({ proc, logs, ...rest }) => rest);
+      .map(({ proc, logs, subscribers, spec, ...rest }) => rest);
   }
 
   getLogs(id) {
@@ -414,6 +509,29 @@ export class JobRunner {
   }
 
   /**
+   * Restart a job: stop the old job (if still running) and start a new job
+   * with the same action spec (steps already planned, incl. runtime prefs).
+   * Waits briefly for the old process to exit so ports / files are freed
+   * before the replacement binds. Returns the new job id, or null when the
+   * job is unknown / has no restartable spec.
+   */
+  async restart(jobId) {
+    const old = this.jobs.get(jobId);
+    if (!old || !old.spec) return null;
+    if (old.status === "running") {
+      this.kill(old.id);
+      // Give taskkill / SIGKILL a moment to free ports before rebinding.
+      for (let i = 0; i < 30; i++) {
+        if (old.status !== "running") break;
+        await this.sleep(100);
+      }
+      await this.sleep(400);
+    }
+    const { actionId, title, steps, longRunning, params } = old.spec;
+    return this.run({ actionId, title, steps, longRunning, params });
+  }
+
+  /**
    * Run an action: spawn step 1, wait, spawn step 2, ... streaming logs.
    * Returns the job id immediately.
    */
@@ -430,6 +548,8 @@ export class JobRunner {
       proc: null,
       logs: [],
       subscribers: new Set(),
+      // Kept for POST /api/restart/:jobId (stop + start again with same spec).
+      spec: { actionId, title, steps, longRunning, params },
     };
     this.jobs.set(jobId, job);
 
@@ -545,6 +665,13 @@ export class JobRunner {
   }
 }
 
+/**
+ * Tools that execute natively on Windows (see NATIVE_ON_WINDOWS): they are
+ * probed via cmd.exe even when WSL is active, so a Windows install counts
+ * as "available" instead of demanding a duplicate install inside WSL.
+ */
+const NATIVE_WINDOWS_TOOLS = new Set(["node", "npm", "bun"]);
+
 /** Detect installed tools and versions for the env endpoint. */
 export async function detectTools(useWsl) {
   const tools = {
@@ -557,11 +684,26 @@ export async function detectTools(useWsl) {
     docker: ["docker", "--version"],
     podman: ["podman", "--version"],
   };
-  const result = {};
-  for (const [name, [bin, flag]] of Object.entries(tools)) {
-    result[name] = await probeTool(bin, flag, useWsl);
-  }
-  return result;
+  // Probe in parallel: sequential WSL spawns took 5×6s (cold boot) and kept
+  // the frontend's Re-check button disabled with a spinner the whole time.
+  const probeOne = async ([bin, flag], nativeFirst) => {
+    if (nativeFirst) {
+      // Prefer the native Windows install (that's where these run);
+      // fall back to the WSL distro so a Linux-only install still shows.
+      const native = await probeNative(bin, flag);
+      if (native.available) return native;
+      if (useWsl) return probeTool(bin, flag, true);
+      return native;
+    }
+    return probeTool(bin, flag, useWsl);
+  };
+  const entries = Object.entries(tools);
+  const results = await Promise.all(
+    entries.map(([name, spec]) =>
+      probeOne(spec, IS_WIN && NATIVE_WINDOWS_TOOLS.has(name)).then((r) => [name, r])
+    )
+  );
+  return Object.fromEntries(results);
 }
 
 /**
@@ -600,6 +742,13 @@ function probeScript(bin, flag) {
 
 function probeTool(bin, flag, useWsl) {
   return new Promise((resolve) => {
+    let done = false;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(v);
+    };
     let proc;
     if (useWsl && IS_WIN) {
       proc = spawn("wsl.exe", [...(WSL_DISTRO ? ["-d", WSL_DISTRO] : []), "-e", "bash", "-lc", probeScript(bin, flag)], {
@@ -613,20 +762,20 @@ function probeTool(bin, flag, useWsl) {
     }
     let out = "";
     const timer = setTimeout(() => {
-      proc.kill();
-      resolve({ available: false });
+      try {
+        proc.kill();
+      } catch { /* already exited */ }
+      finish({ available: false });
     }, 6000);
     proc.stdout?.on("data", (d) => (out += d));
     proc.on("error", () => {
-      clearTimeout(timer);
-      resolve({ available: false });
+      finish({ available: false });
     });
     proc.on("close", (code) => {
-      clearTimeout(timer);
       if (code === 0 && out.trim()) {
-        resolve({ available: true, version: out.trim().split("\n")[0].slice(0, 60) });
+        finish({ available: true, version: out.trim().split("\n")[0].slice(0, 60) });
       } else {
-        resolve({ available: false });
+        finish({ available: false });
       }
     });
   });
@@ -667,6 +816,13 @@ function osReleaseField(text, key) {
 function runOsRelease(useWsl) {
   return new Promise((resolve) => {
     let proc;
+    let done = false;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(v);
+    };
     if (useWsl && IS_WIN) {
       proc = spawn("wsl.exe", [...(WSL_DISTRO ? ["-d", WSL_DISTRO] : []), "-e", "bash", "-lc", "cat /etc/os-release 2>/dev/null"], {
         windowsHide: true,
@@ -680,17 +836,17 @@ function runOsRelease(useWsl) {
     let out = "";
     // Cold WSL boots can take a while on first spawn — allow extra time.
     const timer = setTimeout(() => {
-      proc.kill();
-      resolve(out.trim() || null);
+      try {
+        proc.kill();
+      } catch { /* already exited */ }
+      finish(out.trim() || null);
     }, 15000);
     proc.stdout?.on("data", (d) => (out += d));
     proc.on("error", () => {
-      clearTimeout(timer);
-      resolve(null);
+      finish(null);
     });
     proc.on("close", () => {
-      clearTimeout(timer);
-      resolve(out.trim() || null);
+      finish(out.trim() || null);
     });
   });
 }

@@ -4,12 +4,13 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "concurrently -k -n web,api -c blue,green \"vite\" \"node server/index.js\"",
+    "dev": "concurrently --kill-others-on-fail -n web,api -c blue,green \"vite\" \"node server/index.js\"",
     "dev:web": "vite",
     "dev:server": "node server/index.js --dev",
     "build": "vite build",
     "preview": "vite preview",
-    "start": "npm run build && node server/index.js"
+    "start": "npm run build && node server/index.js",
+    "port": "npx kill-port 4102"
   },
   "dependencies": {
     "@base-ui/react": "^1.0.0-beta.2",

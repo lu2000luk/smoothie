@@ -11,7 +11,7 @@ tokio = { version = "1.52.3", features = ["full"] }
 actix-web = "4.14.0"
 aws-sdk-s3 = "1"
 aws-credential-types = "1"
-reqwest = { version = "0.12", features = ["stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
 futures = "0.3"
 filetime = "0.2"
 bytes = "1"
