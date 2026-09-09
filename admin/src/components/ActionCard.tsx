@@ -297,7 +297,7 @@ export function ActionCard({
               <p className="text-[11px] font-medium text-muted-foreground">
                 Run this time via{" "}
                 <span className="font-normal">
-                  (global: docker {env?.dockerEngineSetting ?? "auto"} · build {env?.buildMode ?? "wsl"})
+                  (global: docker {env?.dockerEngineSetting ?? "auto"} · build {env?.buildMode ?? "windows-cross"})
                 </span>
               </p>
               <div className="flex flex-wrap items-center gap-x-4 gap-y-2">

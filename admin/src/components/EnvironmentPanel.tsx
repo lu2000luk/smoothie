@@ -245,7 +245,7 @@ export function EnvironmentPanel({ env, loading, error, onRetry, onJobStarted }:
                 )}
               </div>
               <BuildModePicker
-                value={env.buildMode ?? "wsl"}
+                value={env.buildMode ?? "windows-cross"}
                 cargoNativeAvailable={!!env.cargoNative?.available}
                 zigNativeAvailable={!!env.zigNative?.available}
                 crossTarget={env.crossTarget}

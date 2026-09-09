@@ -31,13 +31,14 @@ const runner = new JobRunner();
 const CONFIG_PATHS = {
   hypervisor: path.join(PROJECT_ROOT, "hypervisor", "config.json"),
   router: path.join(PROJECT_ROOT, "router", "config.json"),
+  api: path.join(PROJECT_ROOT, "api", "config.json"),
 };
 // Back-compat alias for the single-config UI.
 const CONFIG_PATH = CONFIG_PATHS.hypervisor;
 
 function resolveConfigTarget(input) {
   const t = String(input ?? "hypervisor").toLowerCase();
-  if (t === "hypervisor" || t === "router") return t;
+  if (t === "hypervisor" || t === "router" || t === "api") return t;
   return null;
 }
 
@@ -268,7 +269,21 @@ app.post("/api/preview", async (req, res) => {
 const STOP_TARGETS = {
   "stop-hypervisor": "start-hypervisor",
   "stop-router": "start-router",
+  "stop-api": "start-api",
   "stop-ui": "start-ui",
+};
+
+/**
+ * Pipelines (stop → rebuild → run) replace any previous run of themselves
+ * plus the matching Start-* service job, so re-running a pipeline never
+ * 409s and never leaves two servers fighting over one port. The in-job
+ * stop step (pkill by pattern) then clears orphans started outside the
+ * panel; by the time the Build stage finishes, the port is free for Run.
+ */
+const PIPELINE_TARGETS = {
+  "pipeline-hypervisor": "start-hypervisor",
+  "pipeline-router": "start-router",
+  "pipeline-api": "start-api",
 };
 
 app.post("/api/run", async (req, res) => {
@@ -281,8 +296,18 @@ app.post("/api/run", async (req, res) => {
   const stopTarget = STOP_TARGETS[actionId];
   if (stopTarget) runner.killAction(stopTarget);
 
+  // Running a Pipeline-* action first replaces any previous pipeline run of
+  // the same service plus the matching Start-* job (if any). Never 409s:
+  // re-running a pipeline is the main operation (stop → rebuild → run).
+  const pipelineTarget = PIPELINE_TARGETS[actionId];
+  if (pipelineTarget) {
+    runner.killAction(actionId);
+    runner.killAction(pipelineTarget);
+  }
+
   // Refuse to run two long-running actions of the same id simultaneously
-  if (action.longRunning) {
+  // (pipelines opt out — they auto-replace above instead of conflicting).
+  if (action.longRunning && !pipelineTarget) {
     const already = [...runner.jobs.values()].find(
       (j) => j.actionId === actionId && j.status === "running"
     );
@@ -403,7 +428,7 @@ app.get("/api/stream/:jobId", (req, res) => {
 
 app.get("/api/config", (req, res) => {
   const target = resolveConfigTarget(req.query.target ?? "hypervisor");
-  if (!target) return res.status(400).json({ error: "Unknown config target (want hypervisor|router)" });
+  if (!target) return res.status(400).json({ error: "Unknown config target (want hypervisor|router|api)" });
   const file = CONFIG_PATHS[target];
   if (fs.existsSync(file)) {
     try {
@@ -462,14 +487,42 @@ function validateRouterConfig(config) {
   return null;
 }
 
+function validateApiConfig(config) {
+  // Mirrors api/src/main.rs Config + S3Config.
+  // router_address accepts the `router` / `router_url` aliases the Rust
+  // side deserializes, but canonical written form is `router_address`.
+  const routerAddress = config.router_address ?? config.router ?? config.router_url;
+  if (routerAddress == null) return "Missing required key: router_address";
+  const required = ["s3", "redis"];
+  for (const key of required) {
+    if (!(key in config)) return `Missing required key: ${key}`;
+  }
+  if (typeof config.redis !== "string" || !config.redis) return "redis must be a non-empty string";
+  if (typeof routerAddress !== "string" || !routerAddress)
+    return "router_address must be a non-empty string";
+  if (!config.s3 || typeof config.s3 !== "object") return "s3 must be an object";
+  for (const key of ["access_key", "secret_key", "bucket", "region"]) {
+    if (!(key in config.s3)) return `Missing s3.${key}`;
+  }
+  if (config.port != null && (!Number.isInteger(config.port) || config.port < 1 || config.port > 65535))
+    return "port must be an integer 1-65535";
+  if (config.host != null && typeof config.host !== "string") return "host must be a string";
+  return null;
+}
+
 app.post("/api/config", (req, res) => {
   const { config, target: rawTarget } = req.body ?? {};
   const target = resolveConfigTarget(rawTarget ?? req.query.target ?? "hypervisor");
-  if (!target) return res.status(400).json({ error: "Unknown config target (want hypervisor|router)" });
+  if (!target) return res.status(400).json({ error: "Unknown config target (want hypervisor|router|api)" });
   if (!config || typeof config !== "object") {
     return res.status(400).json({ error: "Body must be { config: {...} }" });
   }
-  const err = target === "router" ? validateRouterConfig(config) : validateHypervisorConfig(config);
+  const err =
+    target === "router"
+      ? validateRouterConfig(config)
+      : target === "api"
+        ? validateApiConfig(config)
+        : validateHypervisorConfig(config);
   if (err) return res.status(400).json({ error: err });
   try {
     const file = CONFIG_PATHS[target];

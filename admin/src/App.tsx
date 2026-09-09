@@ -319,7 +319,7 @@ export default function App() {
           >
             Config
             <Badge variant="secondary" className="h-5 px-1.5 text-[10px]">
-              2
+              3
             </Badge>
           </a>
         </nav>
@@ -396,7 +396,7 @@ export default function App() {
             <div>
               <h2 className="text-xl font-semibold tracking-tight">Smoothie control panel</h2>
               <p className="text-sm text-muted-foreground">
-                One-click dev scripts for the hypervisor, router and services. Every command is
+                One-click dev scripts for the hypervisor, router, api and services. Every command is
                 previewed before it runs.
               </p>
             </div>

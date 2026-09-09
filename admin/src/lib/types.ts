@@ -102,7 +102,7 @@ export interface Action {
   id: string;
   title: string;
   description: string;
-  group: "environment" | "build" | "run" | "services" | "config" | "package";
+  group: "environment" | "build" | "run" | "services" | "config" | "package" | "pipelines";
   /** Long-running actions (server-like) keep running; short ones exit */
   longRunning?: boolean;
   dangerous?: boolean;
@@ -154,7 +154,7 @@ export interface SmoothieConfig {
   [key: string]: unknown;
 }
 
-export type ConfigTarget = "hypervisor" | "router";
+export type ConfigTarget = "hypervisor" | "router" | "api";
 
 export interface RouterServerConfig {
   id: string;
@@ -175,5 +175,22 @@ export interface RouterConfig {
     bucket: string;
     region: string;
   };
+  [key: string]: unknown;
+}
+
+export interface ApiConfig {
+  redis: string;
+  port?: number;
+  host?: string;
+  s3: {
+    access_key: string;
+    secret_key: string;
+    bucket: string;
+    region: string;
+    endpoint?: string;
+    supports_range?: boolean;
+    force_path_style?: boolean;
+  };
+  router_address: string;
   [key: string]: unknown;
 }

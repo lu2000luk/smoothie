@@ -1,4 +1,4 @@
-import type { Action, RunRequest, EnvInfo, JobInfo, RuntimeConfig, RuntimeOverride, PreviewStep, SmoothieConfig, ConfigTarget } from "./types";
+import type { Action, RunRequest, EnvInfo, JobInfo, RuntimeConfig, RuntimeOverride, PreviewStep, SmoothieConfig, RouterConfig, ApiConfig, ConfigTarget } from "./types";
 
 export class BackendUnreachableError extends Error {
   constructor() {
@@ -50,7 +50,7 @@ export const api = {
   jobs: () => fetchJson<JobInfo[]>("/api/jobs"),
 
   config: (target: ConfigTarget = "hypervisor") =>
-    fetchJson<{ exists: boolean; config: SmoothieConfig | null; target: ConfigTarget }>(
+    fetchJson<{ exists: boolean; config: SmoothieConfig | RouterConfig | ApiConfig | null; target: ConfigTarget }>(
       `/api/config?target=${encodeURIComponent(target)}`
     ),
 

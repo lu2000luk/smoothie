@@ -75,6 +75,53 @@ const startS3Steps = [
   },
 ];
 
+/** Stop commands reused by both Stop-* actions and Pipelines (single source of truth). */
+const STOP_CMDS = {
+  hypervisor: `pkill -f "target/.*/release/hypervisor" 2>/dev/null; pkill -f "cargo run.*hypervisor" 2>/dev/null; pkill -f "release/hypervisor" 2>/dev/null; sleep 1; pgrep -af "release/hypervisor|cargo run" 2>/dev/null | grep -i hypervisor || echo "hypervisor stopped (no remaining processes)"`,
+  router: `pkill -f "target/.*/release/router" 2>/dev/null; pkill -f "cargo run.*router" 2>/dev/null; pkill -f "release/router" 2>/dev/null; sleep 1; pgrep -af "release/router|cargo run" 2>/dev/null | grep -i router || echo "router stopped (no remaining processes)"`,
+  api: `pkill -f "target/.*/release/api" 2>/dev/null; pkill -f "cargo run.*api" 2>/dev/null; pkill -f "release/api" 2>/dev/null; sleep 1; pgrep -af "release/api|cargo run" 2>/dev/null | grep -i "\\bapi\\b" || echo "api stopped (no remaining processes)"`,
+};
+
+/**
+ * One-click pipelines: stop → (config check) → incremental build → run.
+ * Fast by design: `cargo build --release` is INCREMENTAL (reuses target/
+ * cache, no `cargo clean`), so a no-change rerun finishes in seconds; the
+ * trailing `cargo run --release` is then a no-op rebuild that execs the
+ * fresh binary and stays running. The leading stop step kills the tracked
+ * Start-* job (server-side, see PIPELINE_TARGETS) plus any orphan binaries
+ * by pattern, so ports are free by the time the Run stage binds.
+ */
+const pipelineSteps = (crate, { needsConfig = false } = {}) => {
+  const steps = [
+    {
+      cmd: STOP_CMDS[crate],
+      note: `Stop any running ${crate} first (tracked job + orphans) — safe when idle.`,
+    },
+  ];
+  if (needsConfig) {
+    const label =
+      crate === "router" ? "Config tab (Router)" : crate === "api" ? "Config tab (API)" : "Config tab";
+    steps.push({
+      cmd: "test -f config.json && echo 'config.json found' || (echo 'MISSING config.json — generate it in the " + label + " first' && exit 1)",
+      cwd: crate,
+      note: `Sanity check: ${crate} refuses to boot without config.json.`,
+    });
+  }
+  steps.push(
+    {
+      cmd: "cargo build --release",
+      cwd: crate,
+      note: `Incremental release build of ${crate} (fast — warm cache, no clean). Honors Windows-cross mode automatically.`,
+    },
+    {
+      cmd: "cargo run --release",
+      cwd: crate,
+      note: `Run ${crate} (stays running; pipeline job keeps streaming its logs).`,
+    }
+  );
+  return steps;
+};
+
 export const actions = [
   // ─── environment ───────────────────────────────────────────────
   {
@@ -94,7 +141,7 @@ export const actions = [
     id: "install-deps",
     title: "Install dependencies",
     description:
-      "Fetches Cargo crates for hypervisor, router and example_app, and installs the admin panel + ui npm dependencies. Safe to re-run at any time.",
+      "Fetches Cargo crates for hypervisor, router, api and example_app, and installs the admin panel + ui npm dependencies. Safe to re-run at any time.",
     group: "environment",
     steps: [
       {
@@ -106,6 +153,11 @@ export const actions = [
         cmd: "cargo fetch",
         cwd: "router",
         note: "Downloads all Cargo dependencies for the router.",
+      },
+      {
+        cmd: "cargo fetch",
+        cwd: "api",
+        note: "Downloads all Cargo dependencies for the api.",
       },
       {
         cmd: "(command -v bun >/dev/null 2>&1 && bun install) || npm install",
@@ -136,13 +188,21 @@ export const actions = [
     steps: [{ cmd: "cargo build --release", cwd: "router", note: "Release build of the router." }],
   },
   {
+    id: "build-api",
+    title: "Build api",
+    description: "Compiles smoothie/api in release mode. Output lands in api/target/release/.",
+    group: "build",
+    steps: [{ cmd: "cargo build --release", cwd: "api", note: "Release build of the api." }],
+  },
+  {
     id: "build-all",
     title: "Build everything",
-    description: "Release-builds hypervisor and router back to back. Use Rebuild-* for a clean build.",
+    description: "Release-builds hypervisor, router and api back to back. Use Rebuild-* for a clean build.",
     group: "build",
     steps: [
       { cmd: "cargo build --release", cwd: "hypervisor", note: "Release build of the hypervisor." },
       { cmd: "cargo build --release", cwd: "router", note: "Release build of the router." },
+      { cmd: "cargo build --release", cwd: "api", note: "Release build of the api." },
     ],
   },
   {
@@ -167,6 +227,16 @@ export const actions = [
     ],
   },
   {
+    id: "rebuild-api",
+    title: "Rebuild api (clean)",
+    description: "Wipes api/target and recompiles from scratch.",
+    group: "build",
+    steps: [
+      { cmd: "cargo clean", cwd: "api", note: "Deletes target/ (all compiled artifacts)." },
+      { cmd: "cargo build --release", cwd: "api", note: "Full recompile." },
+    ],
+  },
+  {
     id: "build-hypervisor-win",
     title: "Build hypervisor (Windows fast)",
     description: `Cross-compiles the hypervisor for Linux (${CROSS_TARGET}) with the native Windows cargo — much faster than building inside WSL. Pair with “Start hypervisor” while build mode is “Windows cross” to run the result in WSL without rebuilding.`,
@@ -181,11 +251,18 @@ export const actions = [
     steps: crossBuildSteps("router"),
   },
   {
+    id: "build-api-win",
+    title: "Build api (Windows fast)",
+    description: `Cross-compiles the api for Linux (${CROSS_TARGET}) with the native Windows cargo — much faster than building inside WSL. Pair with “Start api” while build mode is “Windows cross” to run the result in WSL without rebuilding.`,
+    group: "build",
+    steps: crossBuildSteps("api"),
+  },
+  {
     id: "build-all-win",
     title: "Build everything (Windows fast)",
-    description: `Cross-compiles hypervisor and router back to back with the native Windows cargo (${CROSS_TARGET}). Same outputs as the per-crate fast actions.`,
+    description: `Cross-compiles hypervisor, router and api back to back with the native Windows cargo (${CROSS_TARGET}). Same outputs as the per-crate fast actions.`,
     group: "build",
-    steps: [...crossBuildSteps("hypervisor"), ...crossBuildSteps("router")],
+    steps: [...crossBuildSteps("hypervisor"), ...crossBuildSteps("router"), ...crossBuildSteps("api")],
   },
 
   // ─── services ──────────────────────────────────────────────────
@@ -315,6 +392,22 @@ export const actions = [
     ],
   },
   {
+    id: "start-api",
+    title: "Start api",
+    description:
+      "Runs the api with cargo run (release). Refuses to start without api/config.json — use the Config tab (API) first if it doesn't exist yet. Keeps running until you stop it.",
+    group: "run",
+    longRunning: true,
+    steps: [
+      {
+        cmd: "test -f config.json && echo 'config.json found' || (echo 'MISSING config.json — generate it in the Config tab (API) first' && exit 1)",
+        cwd: "api",
+        note: "Sanity check: api refuses to boot without config.json.",
+      },
+      { cmd: "cargo run --release", cwd: "api", note: "Starts the api (stays running; stop via its Stop button, the Stop-api action, or the Jobs panel)." },
+    ],
+  },
+  {
     id: "start-ui",
     title: "Start ui (dev server)",
     description: "Starts the SvelteKit ui dev server with npm (or bun when available). Keeps running until you stop it.",
@@ -355,6 +448,19 @@ export const actions = [
     ],
   },
   {
+    id: "stop-api",
+    title: "Stop api",
+    description:
+      "Stops the api: kills the tracked job (if running) plus any orphan api processes (release binary or cargo run wrapper). Safe to run when nothing is running.",
+    group: "run",
+    steps: [
+      {
+        cmd: `pkill -f "target/.*/release/api" 2>/dev/null; pkill -f "cargo run.*api" 2>/dev/null; pkill -f "release/api" 2>/dev/null; sleep 1; pgrep -af "release/api|cargo run" 2>/dev/null | grep -i "\\bapi\\b" || echo "api stopped (no remaining processes)"`,
+        note: "Kills api processes by pattern (binary + cargo wrapper), then verifies nothing matching remains. The server also stops the tracked Start-api job.",
+      },
+    ],
+  },
+  {
     id: "stop-ui",
     title: "Stop ui (dev server)",
     description:
@@ -366,6 +472,35 @@ export const actions = [
         note: "Kills vite dev / svelte-kit processes ('vite dev' targets the ui server, not the admin panel which runs plain 'vite' on :5174) and frees :5173. The server also stops the tracked Start-ui job.",
       },
     ],
+  },
+
+  // ─── pipelines (stop → rebuild → run, one click) ────────────────
+  {
+    id: "pipeline-router",
+    title: "Pipeline: router",
+    description:
+      "One-click router pipeline: stops any running router, incremental release rebuild (fast, warm cache), then runs it. Re-running replaces the previous pipeline.",
+    group: "pipelines",
+    longRunning: true,
+    steps: pipelineSteps("router", { needsConfig: true }),
+  },
+  {
+    id: "pipeline-api",
+    title: "Pipeline: api",
+    description:
+      "One-click api pipeline: stops any running api, incremental release rebuild (fast, warm cache), then runs it. Re-running replaces the previous pipeline.",
+    group: "pipelines",
+    longRunning: true,
+    steps: pipelineSteps("api", { needsConfig: true }),
+  },
+  {
+    id: "pipeline-hypervisor",
+    title: "Pipeline: hypervisor",
+    description:
+      "One-click hypervisor pipeline: stops any running hypervisor, incremental release rebuild (fast, warm cache), then runs it. Re-running replaces the previous pipeline.",
+    group: "pipelines",
+    longRunning: true,
+    steps: pipelineSteps("hypervisor", { needsConfig: true }),
   },
 
   // ─── package ───────────────────────────────────────────────────
@@ -387,6 +522,7 @@ export const actions = [
 ];
 
 export const actionGroups = {
+  pipelines: "Pipelines",
   environment: "Environment",
   build: "Build",
   services: "Services",

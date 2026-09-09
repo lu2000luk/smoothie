@@ -27,18 +27,20 @@ export const CROSS_TARGET = "x86_64-unknown-linux-musl";
  *     'windows' runs `docker`/`podman` steps natively via Docker Desktop
  *     instead of routing them through WSL. 'auto' picks 'windows' when a
  *     native docker.exe is detected, otherwise 'wsl'.
- *   buildMode: 'wsl' | 'windows-cross'
+ *   buildMode: 'wsl' | 'windows-cross' (default 'windows-cross')
  *     'windows-cross' compiles cargo steps natively on Windows (fast NTFS,
  *     warm local cache) with `--target <CROSS_TARGET>`, then runs the
  *     resulting Linux binary inside WSL ("build fast, run in WSL").
  * Overridable via SMOOTHIE_DOCKER_ENGINE / SMOOTHIE_BUILD_MODE and via
  * POST /api/runtime (in-memory, per server process).
+ * SMOOTHIE_BUILD_MODE=wsl opts out to in-WSL builds; anything else (or
+ * unset) uses Windows-fast cross-compiles.
  */
 export const runtimeConfig = {
   dockerEngine: ["auto", "wsl", "windows"].includes(process.env.SMOOTHIE_DOCKER_ENGINE)
     ? process.env.SMOOTHIE_DOCKER_ENGINE
     : "auto",
-  buildMode: process.env.SMOOTHIE_BUILD_MODE === "windows-cross" ? "windows-cross" : "wsl",
+  buildMode: process.env.SMOOTHIE_BUILD_MODE === "wsl" ? "wsl" : "windows-cross",
 };
 
 export function getRuntimeConfig() {
