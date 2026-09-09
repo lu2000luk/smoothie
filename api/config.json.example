@@ -11,5 +11,11 @@
   "redis": "redis://localhost:6379",
   "port": 3400,
   "host": "0.0.0.0",
-  "router_address": "127.0.0.1:3300"
+  "router_address": "127.0.0.1:3300",
+  "github": {
+    "client_id": "YOUR_GITHUB_OAUTH_CLIENT_ID",
+    "client_secret": "YOUR_GITHUB_OAUTH_CLIENT_SECRET",
+    "redirect_uri": "http://localhost:3400/auth/github/callback",
+    "frontend_url": "http://localhost:5173"
+  }
 }

@@ -4,6 +4,9 @@ import { sveltekit } from '@sveltejs/kit/vite';
 import { defineConfig } from 'vite';
 
 export default defineConfig({
+	// bits-ui ships uncompiled `.svelte.js` rune modules, which Node cannot
+	// execute as-is. Bundle it so vite-plugin-svelte compiles the runes.
+	ssr: { noExternal: ['bits-ui'] },
 	plugins: [
 		tailwindcss(),
 		sveltekit({

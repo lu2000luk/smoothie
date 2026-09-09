@@ -8,3 +8,5 @@
 - API logic should reside in ../api/
 - Fetch only when needed
 - Follow how the previous designs are implemented, if there is a new design, follow the previous design patterns.
+
+Use https://coss.com/ui/llms.txt but since its a react library just see the components code and translate it.
