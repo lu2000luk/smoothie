@@ -49,6 +49,14 @@ export async function listApps(): Promise<App[]> {
 	return data.apps;
 }
 
+export async function getApp(id: string): Promise<App> {
+	const res = await fetch(`${apiBase}/apps/${encodeURIComponent(id)}`, {
+		headers: authHeaders()
+	});
+	const data = await handle<{ app: App }>(res);
+	return data.app;
+}
+
 export async function createApp(
 	name: string,
 	icon: string | null,

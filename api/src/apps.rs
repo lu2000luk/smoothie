@@ -6,10 +6,10 @@ use rocket::{State, delete, get, patch, post};
 use crate::auth::{SessionToken, require_user};
 use crate::state::{ApiState, conn, json_error};
 
-pub fn key_app(app_id: &str) -> String {
-    format!("app:{app_id}")
-}
-
+/// User-scoped storage: `user:{github_id}:apps` is a HASH
+/// field = app_id, value = App JSON.
+/// Listing is a single HGETALL, fetching is a single HGET —
+/// no global `app:{id}` lookup + per-id fan-out.
 pub fn key_user_apps(github_id: u64) -> String {
     format!("user:{github_id}:apps")
 }
@@ -116,7 +116,7 @@ async fn load_owned_app(
     }
     let mut redis = conn(state).await?;
     let raw: Option<String> = redis
-        .get(key_app(app_id))
+        .hget(key_user_apps(github_id), app_id)
         .await
         .map_err(|e| json_error(Status::ServiceUnavailable, format!("redis unavailable: {e}")))?;
     let raw = raw.ok_or_else(|| json_error(Status::NotFound, "app not found"))?;
@@ -135,21 +135,15 @@ pub async fn list_apps(
 ) -> Result<rocket::serde::json::Json<serde_json::Value>, (Status, rocket::serde::json::Json<serde_json::Value>)> {
     let user = require_user(state, &token).await?;
     let mut redis = conn(state).await?;
-    let ids: Vec<String> = redis
-        .smembers(key_user_apps(user.github_id))
+    let map: std::collections::HashMap<String, String> = redis
+        .hgetall(key_user_apps(user.github_id))
         .await
         .map_err(|e| json_error(Status::ServiceUnavailable, format!("redis unavailable: {e}")))?;
-    let mut apps: Vec<App> = Vec::with_capacity(ids.len());
-    for id in ids {
-        let raw: Option<String> = redis
-            .get(key_app(&id))
-            .await
-            .map_err(|e| json_error(Status::ServiceUnavailable, format!("redis unavailable: {e}")))?;
-        if let Some(raw) = raw {
-            if let Ok(app) = serde_json::from_str::<App>(&raw) {
-                if app.owner_id == user.github_id {
-                    apps.push(app);
-                }
+    let mut apps: Vec<App> = Vec::with_capacity(map.len());
+    for raw in map.into_values() {
+        if let Ok(app) = serde_json::from_str::<App>(&raw) {
+            if app.owner_id == user.github_id {
+                apps.push(app);
             }
         }
     }
@@ -186,11 +180,7 @@ pub async fn create_app(
         .map_err(|e| json_error(Status::InternalServerError, format!("encode app failed: {e}")))?;
     let mut redis = conn(state).await?;
     redis
-        .set::<_, _, ()>(key_app(&app.id), raw)
-        .await
-        .map_err(|e| json_error(Status::ServiceUnavailable, format!("redis unavailable: {e}")))?;
-    redis
-        .sadd::<_, _, ()>(key_user_apps(user.github_id), app.id.clone())
+        .hset::<_, _, _, ()>(key_user_apps(user.github_id), app.id.clone(), raw)
         .await
         .map_err(|e| json_error(Status::ServiceUnavailable, format!("redis unavailable: {e}")))?;
     Ok((Status::Created, rocket::serde::json::Json(serde_json::json!({ "app": app }))))
@@ -263,7 +253,7 @@ pub async fn update_app(
         .map_err(|e| json_error(Status::InternalServerError, format!("encode app failed: {e}")))?;
     let mut redis = conn(state).await?;
     redis
-        .set::<_, _, ()>(key_app(&app.id), raw)
+        .hset::<_, _, _, ()>(key_user_apps(user.github_id), app.id.clone(), raw)
         .await
         .map_err(|e| json_error(Status::ServiceUnavailable, format!("redis unavailable: {e}")))?;
     Ok(rocket::serde::json::Json(serde_json::json!({ "app": app })))
@@ -279,23 +269,15 @@ pub async fn delete_app(
     let app = load_owned_app(state, user.github_id, id).await?;
     let mut redis = conn(state).await?;
 
-    let service_ids: Vec<String> = redis
-        .smembers(crate::services::key_app_services(&app.id))
-        .await
-        .unwrap_or_default();
-    for sid in service_ids {
-        let _: () = redis.del(crate::services::key_service(&sid)).await.unwrap_or(());
-    }
     let _: () = redis
-        .del(crate::services::key_app_services(&app.id))
+        .del(crate::services::key_user_app_services(
+            user.github_id,
+            &app.id,
+        ))
         .await
         .map_err(|e| json_error(Status::ServiceUnavailable, format!("redis unavailable: {e}")))?;
     let _: () = redis
-        .del(key_app(&app.id))
-        .await
-        .map_err(|e| json_error(Status::ServiceUnavailable, format!("redis unavailable: {e}")))?;
-    let _: () = redis
-        .srem(key_user_apps(user.github_id), app.id.clone())
+        .hdel(key_user_apps(user.github_id), app.id.clone())
         .await
         .map_err(|e| json_error(Status::ServiceUnavailable, format!("redis unavailable: {e}")))?;
     Ok(rocket::serde::json::Json(serde_json::json!({ "ok": true })))
@@ -307,7 +289,6 @@ mod tests {
 
     #[test]
     fn app_keys_are_namespaced() {
-        assert_eq!(key_app("abc"), "app:abc");
         assert_eq!(key_user_apps(7), "user:7:apps");
     }
 

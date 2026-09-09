@@ -43,6 +43,17 @@
 		onclose();
 	}
 
+	function selectIcon(sel: IconSelection) {
+		icon = sel;
+		pickerOpen = false;
+	}
+
+	function handleDialogKey(e: KeyboardEvent) {
+		if (!open || e.key !== 'Escape') return;
+		if (pickerOpen) pickerOpen = false;
+		else close();
+	}
+
 	async function submit(e: SubmitEvent) {
 		e.preventDefault();
 		if (!name.trim() || saving) return;
@@ -60,14 +71,16 @@
 	}
 </script>
 
+<svelte:window onkeydown={handleDialogKey} />
+
 {#if open}
 	<div
-		class="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4"
+		class="fixed inset-0 z-50 flex overflow-y-auto bg-black/50 p-4"
 		role="presentation"
 		onclick={close}
 	>
-		<div role="presentation" onclick={(e) => e.stopPropagation()}>
-			<Card class="w-full max-w-sm">
+		<div class="m-auto" role="presentation" onclick={(e) => e.stopPropagation()}>
+			<Card class="w-[440px] max-w-[calc(100vw-2rem)]">
 				<CardHeader>
 					<CardTitle>New app</CardTitle>
 					<CardDescription>Give your app a name and an icon.</CardDescription>
@@ -77,32 +90,22 @@
 						<div class="flex items-center gap-3">
 							<button
 								type="button"
-								onclick={() => (pickerOpen = !pickerOpen)}
+								onclick={() => (pickerOpen = true)}
+								aria-haspopup="dialog"
 								class="shrink-0 rounded-xl outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
 								aria-label="Choose app icon"
 							>
-								<AppIconDisplay kind={icon.kind} value={icon.value} size="lg" class="border" />
+								<AppIconDisplay kind={icon.kind} value={icon.value} size="sm" class="border" />
 							</button>
-							<div class="grid flex-1 gap-1">
-								<label for="new-app-name" class="text-sm font-medium">Name</label>
-								<input
-									id="new-app-name"
-									bind:value={name}
-									placeholder="my-awesome-app"
-									maxlength={64}
-									autocomplete="off"
-									class="h-9 rounded-lg border border-zinc-300 bg-white px-3 text-sm outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-500/30 dark:border-zinc-700 dark:bg-zinc-950"
-								/>
-							</div>
-						</div>
-						{#if pickerOpen}
-							<AppIconPicker
-								value={icon}
-								onselect={(sel) => {
-									icon = sel;
-								}}
+							<input
+								bind:value={name}
+								placeholder="my-awesome-app"
+								aria-label="App name"
+								maxlength={64}
+								autocomplete="off"
+								class="h-9 flex-1 rounded-lg border border-zinc-300 bg-white px-3 text-sm outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-500/30 dark:border-zinc-700 dark:bg-zinc-950"
 							/>
-						{/if}
+						</div>
 						{#if error}
 							<Alert variant="error">
 								<CircleAlert />
@@ -116,6 +119,18 @@
 					</form>
 				</CardPanel>
 			</Card>
+		</div>
+	</div>
+{/if}
+
+{#if open && pickerOpen}
+	<div
+		class="fixed inset-0 z-[70] flex overflow-y-auto bg-black/60 p-4"
+		role="presentation"
+		onclick={() => (pickerOpen = false)}
+	>
+		<div class="m-auto" role="presentation" onclick={(e) => e.stopPropagation()}>
+			<AppIconPicker value={icon} onselect={selectIcon} onclose={() => (pickerOpen = false)} />
 		</div>
 	</div>
 {/if}

@@ -1,11 +1,13 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import LoginCard from './LoginCard.svelte';
-	import DashboardScreen from './DashboardScreen.svelte';
+	import { page } from '$app/state';
+	import AppDetailScreen from '$lib/components/AppDetailScreen.svelte';
+	import LoginCard from '$lib/components/LoginCard.svelte';
 	import { Spinner } from '$lib/components/ui/spinner/index.js';
 	import { fetchMe, getSession, loginUrl, logout, type AuthUser } from '$lib/auth';
 
-	let { error = '' }: { error?: string } = $props();
+	const appId = $derived(page.params.id ?? '');
+
 	let status: 'checking' | 'anonymous' | 'authenticated' = $state('checking');
 	let user: AuthUser | null = $state(null);
 
@@ -32,19 +34,23 @@
 </script>
 
 {#if status === 'authenticated' && user}
-	<DashboardScreen {user} onlogout={handleLogout} />
+	<AppDetailScreen {user} {appId} onlogout={handleLogout} />
 {:else}
 	<div class="login-shell flex min-h-screen items-center justify-center px-6 py-12">
 		<main class="w-full">
 			{#if status === 'checking'}
-				<Spinner class="size-8" />
+				<div class="flex justify-center">
+					<Spinner class="size-8" />
+				</div>
 			{:else}
-				<LoginCard loginHref={loginUrl} {error} />
+				<LoginCard loginHref={loginUrl} />
 			{/if}
 		</main>
 	</div>
 {/if}
 
 <style>
-	.login-shell { background: #171717; }
+	.login-shell {
+		background: #171717;
+	}
 </style>

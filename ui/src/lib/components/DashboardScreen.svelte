@@ -6,8 +6,6 @@
 	import { Spinner } from '$lib/components/ui/spinner/index.js';
 	import AppCard from './AppCard.svelte';
 	import AppCreateDialog from './AppCreateDialog.svelte';
-	import AppDeleteDialog from './AppDeleteDialog.svelte';
-	import AppRenameDialog from './AppRenameDialog.svelte';
 	import { listApps, type App } from '$lib/apps';
 
 	let { user, onlogout }: { user: AuthUser; onlogout: () => void } = $props();
@@ -17,8 +15,6 @@
 	let loadError = $state('');
 	let query = $state('');
 	let createOpen = $state(false);
-	let renameTarget = $state<App | null>(null);
-	let deleteTarget = $state<App | null>(null);
 
 	const initials = $derived(user.login.slice(0, 2).toUpperCase());
 
@@ -100,7 +96,7 @@
 		{:else if filtered.length === 0 && !query}
 			<div class="grid gap-2 rounded-2xl border border-dashed p-10 text-center">
 				<p class="font-medium">No apps yet</p>
-				<p class="text-sm text-zinc-500">Create your first app to add services (containers).</p>
+				<p class="text-sm text-zinc-500">Create your first app to get started.</p>
 				<div class="mt-2 flex justify-center">
 					<Button onclick={() => (createOpen = true)}>
 						<Plus />
@@ -111,13 +107,9 @@
 		{:else if filtered.length === 0}
 			<p class="py-10 text-center text-sm text-zinc-500">No apps match “{query}”.</p>
 		{:else}
-			<div class="grid gap-3">
+			<div class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
 				{#each filtered as app (app.id)}
-					<AppCard
-						{app}
-						onrename={(a) => (renameTarget = a)}
-						ondelete={(a) => (deleteTarget = a)}
-					/>
+					<AppCard {app} />
 				{/each}
 			</div>
 		{/if}
@@ -129,22 +121,6 @@
 		oncreated={(app) => {
 			apps = [app, ...apps];
 			createOpen = false;
-		}}
-	/>
-	<AppRenameDialog
-		app={renameTarget}
-		onclose={() => (renameTarget = null)}
-		onrenamed={(updated) => {
-			apps = apps.map((a) => (a.id === updated.id ? updated : a));
-			renameTarget = null;
-		}}
-	/>
-	<AppDeleteDialog
-		app={deleteTarget}
-		onclose={() => (deleteTarget = null)}
-		ondeleted={(id) => {
-			apps = apps.filter((a) => a.id !== id);
-			deleteTarget = null;
 		}}
 	/>
 </div>
