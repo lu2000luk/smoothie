@@ -7,7 +7,7 @@
 		type ServicePackage
 	} from '$lib/api/services';
 	import { Alert, AlertDescription } from '$lib/components/ui/alert/index.js';
-	import { Button } from '$lib/components/ui/button/index.js';
+	import { Button, buttonVariants } from '$lib/components/ui/button/index.js';
 
 	let {
 		appId,
@@ -24,9 +24,11 @@
 	} = $props();
 
 	let name = $state('');
-	let port = $state('');
+	let port = $state<string | number>('');
 	let argv = $state('');
 	let saving = $state(false);
+	let saved = $state(false);
+	let formServiceId = $state('');
 	let clearing = $state(false);
 	let deleting = $state(false);
 	let error = $state('');
@@ -49,19 +51,33 @@
 		clearConfirmOpen = false;
 		error = '';
 		packageError = '';
+		if (formServiceId !== service.id) {
+			formServiceId = service.id;
+			saved = false;
+		}
 	});
 
-	async function save(event: SubmitEvent) {
-		event.preventDefault();
+	async function save(event?: SubmitEvent) {
+		event?.preventDefault();
 		if (!name.trim() || saving) return;
-		const parsedPort = Number(port);
-		if (!port.trim() || !Number.isInteger(parsedPort) || parsedPort < 1 || parsedPort > 65535) {
+		const normalizedPort = String(port).trim();
+		const parsedPort = Number(normalizedPort);
+		if (!normalizedPort || !Number.isInteger(parsedPort) || parsedPort < 1 || parsedPort > 65535) {
 			error = 'Port must be a whole number from 1 to 65535.';
 			return;
 		}
 		saving = true;
+		saved = false;
 		error = '';
 		try {
+		  console.log('Updating service with:', {
+            name: name.trim(),
+            container_port: parsedPort,
+            argv: argv
+              .split('\n')
+              .map((argument) => argument.trim())
+              .filter(Boolean)
+          });
 			const updated = await updateService(appId, service.id, {
 				name: name.trim(),
 				container_port: parsedPort,
@@ -71,6 +87,7 @@
 					.filter(Boolean)
 			});
 			onupdated(updated);
+			saved = true;
 		} catch (caught) {
 			error = caught instanceof Error ? caught.message : 'Could not save service settings.';
 		} finally {
@@ -109,7 +126,7 @@
 </script>
 
 <div class="grid gap-7">
-	<form class="grid gap-4" onsubmit={save}>
+	<form class="grid gap-4" onsubmit={save} novalidate>
 		<div>
 			<h3 class="text-sm font-semibold text-zinc-100">Service settings</h3>
 			<p class="mt-1 text-xs text-zinc-500">
@@ -163,12 +180,20 @@
 				<CircleAlert />
 				<AlertDescription>{error}</AlertDescription>
 			</Alert>
+		{:else if saved}
+			<p class="text-xs text-emerald-300" role="status">Settings saved.</p>
 		{/if}
 
 		<div>
-			<Button type="submit" loading={saving} disabled={!name.trim()}>
-				<Save /> Save settings
-			</Button>
+			<button
+				type="button"
+				class={buttonVariants()}
+				disabled={saving || !name.trim()}
+				aria-busy={saving}
+				onclick={() => save()}
+			>
+				<Save /> {saving ? 'Saving...' : 'Save settings'}
+			</button>
 		</div>
 	</form>
 

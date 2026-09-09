@@ -17,6 +17,9 @@
  *   forceWsl — always route this step through WSL on Windows.
  *   cross — this `cargo build` targets Linux (x86_64-unknown-linux-musl)
  *     via zig and runs natively on Windows; one-click fast path.
+ *   windowsOnly — skip this step on Linux/macOS hosts (e.g. `taskkill`).
+ *   unixOnly — skip this step on Windows hosts (e.g. `pkill` cleanup when
+ *     the action already has a native Windows twin).
  */
 
 const DOCKER = "docker";
@@ -121,6 +124,30 @@ const pipelineSteps = (crate, { needsConfig = false } = {}) => {
   );
   return steps;
 };
+
+/**
+ * The api has no Docker-socket or Linux-only dependencies (plain HTTP +
+ * Redis + S3), so unlike hypervisor/router it runs fine as a native Windows
+ * binary. These `forceNativeWindows` steps bypass the WSL / cross-compile
+ * flow entirely: plain `cargo run --release` on every platform. The `cargo`
+ * steps are portable (normal cargo on Linux/macOS too); only the
+ * orphan-cleanup steps are platform-gated (`taskkill` on Windows, `pkill`
+ * elsewhere) so no step ever needs WSL. QUOTING: native steps run via
+ * `cmd.exe /s /c "…"` — keep them quoteless and paren-free in echo text.
+ */
+const apiNativeStopSteps = [
+  {
+    cmd: "taskkill /F /IM api.exe 2>NUL & echo native api processes checked",
+    note: "Kills native Windows api.exe orphans (the server also stops the tracked job). Windows-only.",
+    forceNativeWindows: true,
+    windowsOnly: true,
+  },
+  {
+    cmd: STOP_CMDS.api,
+    note: "Kills api processes by pattern on Linux/macOS. Skipped on Windows — run “Stop api” too if you previously ran the WSL variant.",
+    unixOnly: true,
+  },
+];
 
 export const actions = [
   // ─── environment ───────────────────────────────────────────────
@@ -234,6 +261,21 @@ export const actions = [
     steps: [
       { cmd: "cargo clean", cwd: "api", note: "Deletes target/ (all compiled artifacts)." },
       { cmd: "cargo build --release", cwd: "api", note: "Full recompile." },
+    ],
+  },
+  {
+    id: "build-api-native",
+    title: "Build api (Windows native)",
+    description:
+      "Compiles the api for the HOST platform with native cargo (a Windows api.exe on Windows — no musl cross-compile, no WSL). Output lands in api/target/release/. Pair with “Start api (Windows native)”. On Linux/macOS this is just a normal cargo build.",
+    group: "build",
+    steps: [
+      {
+        cmd: "cargo build --release",
+        cwd: "api",
+        forceNativeWindows: true,
+        note: "Native release build of the api (host target, not musl).",
+      },
     ],
   },
   {
@@ -408,6 +450,22 @@ export const actions = [
     ],
   },
   {
+    id: "start-api-native",
+    title: "Start api (Windows native)",
+    description:
+      "Runs the api NATIVELY on Windows with plain `cargo run --release` (Windows binary, no WSL, no cross-compile — the api needs no Docker socket). Same plain `cargo run` on Linux/macOS. Needs api/config.json first (Config tab → API) plus reachable Redis/S3. Keeps running until you stop it. Note: native and WSL runs both bind :3400 — stop the other runtime first.",
+    group: "run",
+    longRunning: true,
+    steps: [
+      {
+        cmd: "cargo run --release",
+        cwd: "api",
+        forceNativeWindows: true,
+        note: "Starts the api natively (stays running; stop via its Stop button, the Stop-api-native action, or the Jobs panel). First run compiles the host binary.",
+      },
+    ],
+  },
+  {
     id: "start-ui",
     title: "Start ui (dev server)",
     description: "Starts the SvelteKit ui dev server with npm (or bun when available). Keeps running until you stop it.",
@@ -461,6 +519,14 @@ export const actions = [
     ],
   },
   {
+    id: "stop-api-native",
+    title: "Stop api (Windows native)",
+    description:
+      "Stops the natively-run api: kills the tracked job (if running) plus any native api.exe orphans — no WSL needed. Safe to run when nothing is running. If you previously ran the WSL variant, run “Stop api” too.",
+    group: "run",
+    steps: apiNativeStopSteps,
+  },
+  {
     id: "stop-ui",
     title: "Stop ui (dev server)",
     description:
@@ -492,6 +558,29 @@ export const actions = [
     group: "pipelines",
     longRunning: true,
     steps: pipelineSteps("api", { needsConfig: true }),
+  },
+  {
+    id: "pipeline-api-native",
+    title: "Pipeline: api (Windows native)",
+    description:
+      "One-click NATIVE api pipeline: stops any native api, incremental host rebuild (fast, warm cache), then runs it natively — no WSL, no cross-compile. Re-running replaces the previous native pipeline and frees :3400 from WSL api runs too. Needs api/config.json (Config tab → API).",
+    group: "pipelines",
+    longRunning: true,
+    steps: [
+      ...apiNativeStopSteps,
+      {
+        cmd: "cargo build --release",
+        cwd: "api",
+        forceNativeWindows: true,
+        note: "Incremental native release build (fast — warm cache, no clean).",
+      },
+      {
+        cmd: "cargo run --release",
+        cwd: "api",
+        forceNativeWindows: true,
+        note: "Run the api natively (stays running; pipeline job keeps streaming its logs).",
+      },
+    ],
   },
   {
     id: "pipeline-hypervisor",

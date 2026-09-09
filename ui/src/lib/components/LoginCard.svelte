@@ -8,7 +8,7 @@
 
 <section class="mx-auto w-full max-w-xs">
 	<h1 class="login-wordmark mb-6 text-center text-4xl font-bold tracking-[-0.065em] text-white sm:text-[2.7rem]">
-		smoothie.
+		smoothie
 	</h1>
 
 	{#if error}
@@ -19,6 +19,10 @@
 	{/if}
 
 	<LoginButton href={loginHref} />
+
+	<p class="absolute font-sans bottom-6 left-1/2 -translate-x-1/2">
+	    Smoothie &copy; 2026
+	</p>
 </section>
 
 <style>

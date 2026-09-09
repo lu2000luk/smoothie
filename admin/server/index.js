@@ -241,16 +241,20 @@ app.post("/api/preview", async (req, res) => {
       cmd: substituteParams(s.cmd, allParams),
     }));
     const plan = buildPlan(steps, await planOverrides(runtimeOpts));
+    // Platform-gated steps (windowsOnly/unixOnly) are omitted — the preview
+    // shows exactly what would run on THIS host.
     res.json({
-      steps: plan.map((p) => ({
-        cmd: p.cmd,
-        cwd: p.cwd,
-        note: p.note,
-        wsl: p.useWsl,
-        engine: p.engine,
-        nativeWindows: p.nativeWindows,
-        crossTarget: p.crossTarget ?? undefined,
-      })),
+      steps: plan
+        .filter((p) => !p.skipped)
+        .map((p) => ({
+          cmd: p.cmd,
+          cwd: p.cwd,
+          note: p.note,
+          wsl: p.useWsl,
+          engine: p.engine,
+          nativeWindows: p.nativeWindows,
+          crossTarget: p.crossTarget ?? undefined,
+        })),
     });
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -266,10 +270,18 @@ app.post("/api/preview", async (req, res) => {
  * child process group). Killed first so the cleanup step below can verify
  * a quiet system; orphans are caught by the pkill patterns in actions.js.
  */
+/**
+ * Every api runtime binds :3400, so each api Stop action kills the tracked
+ * jobs of ALL api runners (WSL + native, start + pipeline) — "stop api"
+ * means the port is free afterwards no matter how it was started. The shell
+ * cleanup steps stay runtime-specific (taskkill vs pkill); values may be a
+ * single action id or a list.
+ */
 const STOP_TARGETS = {
   "stop-hypervisor": "start-hypervisor",
   "stop-router": "start-router",
-  "stop-api": "start-api",
+  "stop-api": ["start-api", "start-api-native", "pipeline-api", "pipeline-api-native"],
+  "stop-api-native": ["start-api-native", "start-api", "pipeline-api-native", "pipeline-api"],
   "stop-ui": "start-ui",
 };
 
@@ -279,11 +291,14 @@ const STOP_TARGETS = {
  * 409s and never leaves two servers fighting over one port. The in-job
  * stop step (pkill by pattern) then clears orphans started outside the
  * panel; by the time the Build stage finishes, the port is free for Run.
+ * Api pipelines additionally replace the sibling runtime (WSL ↔ native)
+ * since both bind :3400.
  */
 const PIPELINE_TARGETS = {
   "pipeline-hypervisor": "start-hypervisor",
   "pipeline-router": "start-router",
-  "pipeline-api": "start-api",
+  "pipeline-api": ["start-api", "start-api-native", "pipeline-api-native"],
+  "pipeline-api-native": ["start-api-native", "start-api", "pipeline-api"],
 };
 
 app.post("/api/run", async (req, res) => {
@@ -293,21 +308,21 @@ app.post("/api/run", async (req, res) => {
 
   // Running a Stop-* action first kills the tracked Start-* job (if any).
   // Never 409s: stopping when nothing runs is fine (shell step reports it).
-  const stopTarget = STOP_TARGETS[actionId];
-  if (stopTarget) runner.killAction(stopTarget);
+  const stopTargets = STOP_TARGETS[actionId];
+  if (stopTargets) for (const t of [].concat(stopTargets)) runner.killAction(t);
 
   // Running a Pipeline-* action first replaces any previous pipeline run of
   // the same service plus the matching Start-* job (if any). Never 409s:
   // re-running a pipeline is the main operation (stop → rebuild → run).
-  const pipelineTarget = PIPELINE_TARGETS[actionId];
-  if (pipelineTarget) {
+  const pipelineTargets = PIPELINE_TARGETS[actionId];
+  if (pipelineTargets) {
     runner.killAction(actionId);
-    runner.killAction(pipelineTarget);
+    for (const t of [].concat(pipelineTargets)) runner.killAction(t);
   }
 
   // Refuse to run two long-running actions of the same id simultaneously
   // (pipelines opt out — they auto-replace above instead of conflicting).
-  if (action.longRunning && !pipelineTarget) {
+  if (action.longRunning && !pipelineTargets) {
     const already = [...runner.jobs.values()].find(
       (j) => j.actionId === actionId && j.status === "running"
     );

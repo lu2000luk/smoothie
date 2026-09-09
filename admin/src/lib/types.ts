@@ -86,6 +86,16 @@ export interface CommandStep {
   cwd?: string;
   /** Human-readable explanation of this step */
   note?: string;
+  /** Run via cmd.exe on Windows, bypassing WSL / cross-compile flow */
+  forceNativeWindows?: boolean;
+  /** Always route through WSL on Windows */
+  forceWsl?: boolean;
+  /** This `cargo build` targets Linux via zig (one-click fast path) */
+  cross?: boolean;
+  /** Skip this step on Linux/macOS hosts (e.g. `taskkill` cleanup) */
+  windowsOnly?: boolean;
+  /** Skip this step on Windows hosts (e.g. `pkill` twin of a native step) */
+  unixOnly?: boolean;
 }
 
 export interface ActionParam {

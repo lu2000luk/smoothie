@@ -6,8 +6,7 @@
 	let { href, class: className = '' }: { href: string; class?: string } = $props();
 </script>
 
-<Button {href} variant="outline" size="lg" class={`group h-12 w-full text-sm sm:h-12 ${className}`}>
-	<GithubLogo size={20} class="size-5" />
+<Button {href} variant="outline" size="lg" class={`group h-10 w-full text-sm sm:h-10 ${className}`}>
+	<GithubLogo size={20} class="size-5 pr-1" />
 	<span>Continue with GitHub</span>
-	<ArrowRight class="transition-transform group-hover:translate-x-0.5" />
 </Button>

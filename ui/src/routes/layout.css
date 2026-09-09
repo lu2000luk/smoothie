@@ -1,3 +1,4 @@
+@import '@fontsource/lexend';
 @import 'tailwindcss';
 @import 'tw-animate-css';
 @plugin '@tailwindcss/typography';
@@ -95,9 +96,9 @@
 }
 
 @theme inline {
-	--font-heading: var(--font-sans, ui-sans-serif, system-ui, sans-serif);
-	--font-mono: var(--font-mono, ui-monospace, monospace);
-	--font-sans: var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+	--font-heading: 'Lexend', ui-sans-serif, system-ui, sans-serif;
+	--font-mono: ui-monospace, monospace;
+	--font-sans: 'Lexend', ui-sans-serif, system-ui, sans-serif;
 	--color-accent: var(--accent);
 	--color-accent-foreground: var(--accent-foreground);
 	--color-background: var(--background);
@@ -147,11 +148,15 @@
 	}
 	body {
 		@apply bg-background text-foreground;
+		font-family: var(--font-sans);
 	}
 	code,
 	kbd,
 	samp,
 	pre {
 		font-family: var(--font-mono);
+	}
+	.f {
+	    font-family: var(--font-sans);
 	}
 }

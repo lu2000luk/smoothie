@@ -313,6 +313,11 @@ export const LEGACY_PKG_DIR = "/tmp/smoothie-pkg";
  * Steps may also carry author hints: `forceNativeWindows` / `forceWsl`,
  * plus `cross: true` ("this cargo build should target Linux" — used by the
  * one-click Windows-fast actions and honored on every platform).
+ * Platform gating: `windowsOnly: true` skips the step on Linux/macOS hosts,
+ * `unixOnly: true` skips it on Windows hosts. Gated-out steps are marked
+ * `skipped` in the plan: /api/preview omits them and the runner logs a line
+ * and moves on (so e.g. a `taskkill` cleanup only exists on Windows while a
+ * `pkill` twin only exists elsewhere — no step ever needs WSL).
  */
 export function buildPlan(steps, overrides = {}) {
   const buildMode = overrides.buildMode ?? runtimeConfig.buildMode;
@@ -322,6 +327,24 @@ export function buildPlan(steps, overrides = {}) {
     engineSetting === "windows" ? "windows" : engineSetting === "wsl" ? "wsl" : overrides.nativeDocker ? "windows" : "wsl";
 
   return steps.map((step) => {
+    // Platform-gated steps (e.g. taskkill on Windows vs pkill elsewhere):
+    // mark skipped so preview can omit them and the runner can log + move on.
+    if ((step.windowsOnly && !IS_WIN) || (step.unixOnly && IS_WIN)) {
+      const relCwd = step.cwd ? path.resolve(PROJECT_ROOT, step.cwd) : PROJECT_ROOT;
+      return {
+        cmd: step.cmd,
+        bashCmd: step.cmd,
+        cwd: relCwd,
+        wslCwd: relCwd,
+        useWsl: false,
+        note: step.note,
+        engine: classifyStep(step.cmd),
+        nativeWindows: false,
+        crossTarget: null,
+        skipped: true,
+        skipReason: step.windowsOnly ? "Windows-only step" : "Unix-only step",
+      };
+    }
     const relCwd = step.cwd ? path.resolve(PROJECT_ROOT, step.cwd) : PROJECT_ROOT;
     const scope = classifyStep(step.cmd);
     let cmd = step.cmd;
@@ -417,7 +440,7 @@ export function buildPlan(steps, overrides = {}) {
       // exist on a stock Windows box.
       nativeWindows = true;
     }
-    return { cmd, bashCmd, cwd: relCwd, wslCwd, useWsl, note, engine: scope, nativeWindows, crossTarget };
+    return { cmd, bashCmd, cwd: relCwd, wslCwd, useWsl, note, engine: scope, nativeWindows, crossTarget, skipped: false };
   });
 }
 
@@ -558,6 +581,13 @@ export class JobRunner {
     (async () => {
       for (let i = 0; i < steps.length; i++) {
         const plan = steps[i];
+        if (plan.skipped) {
+          this.pushLog(job, {
+            stream: "system",
+            text: `── Skipped ${plan.skipReason ?? "platform-gated step"}: $ ${plan.cmd}`,
+          });
+          continue;
+        }
         if (job.status !== "running") return; // killed mid-run
         if (i > 0 && !longRunning) {
           await this.sleep(150); // small gap so step boundaries render separately
