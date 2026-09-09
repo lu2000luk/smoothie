@@ -9,7 +9,7 @@ boot modes: - Restart (simple cold boot) - Freeze (docker pause the container an
 process: run all processes inside the same container but each process with cgroups stuff (nix crate)
 
 package format: (since we have multiple run modes the apps are packaged in an universal way) (stored in S3, store in LRU disk cache)
-.tar file: - main (entrypoint) - ... (any other files, will be injected together with the entrypoint)
+.tar file: uncompressed, at most 256 MiB archive data, 4,096 entries, and 256 MiB declared extracted data. Entries must use POSIX-relative paths with no absolute paths, `..`, NUL bytes, backslashes, or duplicate normalized paths. Only regular files and directories are accepted; links, devices, FIFOs, sparse metadata, and other special entries are rejected. `main` must be a regular executable file at the archive root. Other regular files/directories are injected with it.
 
 container API:
 - `select_tarball(path)` validates the selected `.tar` file.

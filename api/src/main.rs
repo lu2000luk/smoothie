@@ -1,14 +1,19 @@
 mod apps;
 mod auth;
 mod config;
+mod deployments;
+mod packages;
 mod services;
 mod state;
 
-use rocket::{get, options, routes};
-use rocket::http::Status;
 use rocket::State;
+use rocket::data::{Limits, ToByteUnit};
+use rocket::http::Status;
+use rocket::{get, options, routes};
 
-use config::{load_config, parse_host, router_base_url, defaults, github_configured};
+use config::{
+    defaults, github_configured, load_config, parse_host, router_base_url, s3_force_path_style,
+};
 use state::{ApiState, Cors};
 
 #[get("/")]
@@ -45,9 +50,14 @@ fn rocket() -> _ {
     };
 
     if github_configured(&config.github) {
-        println!("GitHub auth: enabled (redirect_uri={})", config.github.redirect_uri);
+        println!(
+            "GitHub auth: enabled (redirect_uri={})",
+            config.github.redirect_uri
+        );
     } else {
-        println!("GitHub auth: DISABLED - set github.client_id / github.client_secret in config.json");
+        println!(
+            "GitHub auth: DISABLED - set github.client_id / github.client_secret in config.json"
+        );
     }
 
     let port = config.port.unwrap_or_else(defaults::port);
@@ -57,14 +67,35 @@ fn rocket() -> _ {
     println!("S3 bucket: {} ({})", config.s3.bucket, config.s3.region);
     println!("Starting server: http://localhost:{port}");
 
+    let limits = Limits::default()
+        .limit("file", 200.mebibytes())
+        .limit("data-form", 201.mebibytes());
     let figment = rocket::Config::figment()
         .merge(("address", address))
-        .merge(("port", port));
+        .merge(("port", port))
+        .merge(("limits", limits));
     let frontend_url = config.github.frontend_url.clone();
+    let credentials = aws_sdk_s3::config::Credentials::new(
+        config.s3.access_key.clone(),
+        config.s3.secret_key.clone(),
+        None,
+        None,
+        "smoothie-config",
+    );
+    let mut s3_config = aws_sdk_s3::config::Builder::new()
+        .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+        .region(aws_sdk_s3::config::Region::new(config.s3.region.clone()))
+        .credentials_provider(credentials)
+        .force_path_style(s3_force_path_style(config.s3.force_path_style));
+    if let Some(endpoint) = config.s3.endpoint.as_deref() {
+        s3_config = s3_config.endpoint_url(endpoint);
+    }
     let state = ApiState {
         config,
         redis: redis_client,
         http: reqwest::Client::new(),
+        s3: aws_sdk_s3::Client::from_conf(s3_config.build()),
+        service_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     };
 
     rocket::custom(figment)
@@ -87,9 +118,20 @@ fn rocket() -> _ {
                 apps::update_app,
                 apps::delete_app,
                 services::list_services,
+                services::get_service,
                 services::create_service,
                 services::update_service,
+                services::update_service_position,
                 services::delete_service,
+                packages::list_service_packages,
+                packages::upload_service_package,
+                packages::delete_service_package,
+                packages::activate_service_package,
+                deployments::list_service_deployments,
+                deployments::get_deployment_status,
+                deployments::start_service,
+                deployments::retry_deployment,
+                deployments::stop_service,
             ],
         )
 }

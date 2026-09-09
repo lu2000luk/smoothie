@@ -18,3 +18,4 @@ filetime = "0.2"
 bytes = "1"
 bollard = "0.21"
 uuid = { version = "1", features = ["v4"] }
+tar = { version = "0.4", default-features = false }

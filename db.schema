@@ -1,34 +1,89 @@
-apps:[id]:
-    name: string
-    created_at: datetime
-    owner_id: string
-    build: string (build id)
-    runtime: 0 = alpine (more to come)
-    binding: number | null (port)
-    optimizations: number (int8 -> binary flags) [ mem snapshot | cgroup pause | process sandboxing ] (always enabled: restart & container)
-    [stream] deployment_history string (build id)
-    [stream] logs string (format [datetime]$[level]$[message])
+# Authentication and user-owned application metadata
+user:{github_id}:apps (hash)
+    field: app_id
+    value: App JSON
+        id: string
+        owner_id: number
+        name: string
+        icon: string | null
+        icon_kind: "emoji" | "icon" | "upload" | null
+        created_at: datetime
+        updated_at: datetime
 
-builds:[id]:
-    app_id: string
-    created_at: datetime
-    package: string (id to lookup on s3)
-    args: string
-    aarch: bool (false = arm64, true = x86 [prefer building on arm64])
-    analysis: (bool) (true = package analyzed)
-        size: number (bytes)
-        contents: string (json [ { path, size } ])
-    source: string ("ci" | "cli" | "web")
-    in_use: bool (when packages aren't in use they are compressed)
-    hash: string
+# A service is a movable canvas node and runtime configuration. It may exist
+# without a package or deployment.
+user:{github_id}:app:{app_id}:services (hash)
+    field: service_id
+    value: Service JSON
+        id: string
+        app_id: string
+        owner: number
+        name: string
+        position_x: number
+        position_y: number
+        container_port: number
+        argv: string[] (arguments appended to ./main)
+        active_package_id: string | null
+        active_deployment_id: string | null
+        package_ids: string[] (oldest to newest; IDs are retained after pruning/deletion)
+        created_at: datetime
+        updated_at: datetime
 
-domains:[domain]: (bool)
+# Packages are immutable archive versions linked to one service. Available
+# blobs are stored in S3 as {package_id}.tar. Each service may retain at most
+# 209715200 bytes (200 MiB) of available package blobs; old inactive blobs are
+# pruned first while their metadata remains in this hash.
+user:{github_id}:app:{app_id}:service:{service_id}:packages (hash)
+    field: package_id
+    value: Package JSON
+        id: string
+        service_id: string
+        app_id: string
+        owner: number
+        filename: string
+        sha256: string
+        size_bytes: number
+        blob_status: "available" | "pruned" | "deleted"
+        created_at: datetime
+        pruned_at: datetime | null
+        deleted_at: datetime | null
+
+# Deployments preserve each attempt to run a package and the runtime settings
+# used for that attempt. Router-derived fields may be refreshed while the
+# deployment identity, package, argv, and port remain stable.
+user:{github_id}:app:{app_id}:service:{service_id}:deployments (hash)
+    field: deployment_id
+    value: Deployment JSON
+        id: string
+        service_id: string
+        package_id: string
+        app_id: string
+        owner: number
+        argv: string[] (full command beginning with ./main)
+        port: number
+        status: "deploying" | "running" | "stopped" | "failed" | "not_found"
+        host: string | null
+        host_port: number | null
+        container_port: number | null
+        container_id: string | null
+        error: string | null
+        created_at: datetime
+        updated_at: datetime
+
+# Domain routing remains on the legacy domain -> app -> build -> package path
+# until service domain bindings are implemented.
+domains:{domain} (hash)
     user_id: string
     added_at: datetime
     verified: bool
     verification_token: string
     bind: string (app_id)
 
-req:[id]: (stream any)
+apps:{app_id} (hash)
+    build: string (build_id)
 
-logs:[container id] (stream string)
+builds:{build_id} (hash)
+    package: string (package_id)
+
+req:{request_id} (stream)
+logs:{container_id} (stream)

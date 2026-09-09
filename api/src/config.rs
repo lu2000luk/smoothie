@@ -144,6 +144,10 @@ pub fn github_configured(cfg: &GithubConfig) -> bool {
     !cfg.client_id.is_empty() && !cfg.client_secret.is_empty()
 }
 
+pub fn s3_force_path_style(configured: Option<bool>) -> bool {
+    configured.unwrap_or(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,9 +159,13 @@ mod tests {
         assert_eq!(cfg.host.as_deref(), Some("0.0.0.0"));
         assert_eq!(cfg.redis, "redis://localhost:6379");
         assert_eq!(cfg.router_address, "127.0.0.1:3300");
-        assert_eq!(router_base_url(&cfg.router_address), "http://127.0.0.1:3300");
+        assert_eq!(
+            router_base_url(&cfg.router_address),
+            "http://127.0.0.1:3300"
+        );
         assert_eq!(cfg.s3.bucket, "packages");
         assert_eq!(cfg.s3.region, "us-east-1");
+        assert!(s3_force_path_style(cfg.s3.force_path_style));
         assert_eq!(
             cfg.github.redirect_uri,
             "http://localhost:3400/auth/github/callback"
@@ -184,7 +192,13 @@ mod tests {
         )
         .expect("minimal config parses");
         assert_eq!(cfg.s3.endpoint, None);
+        assert!(s3_force_path_style(cfg.s3.force_path_style));
         assert!(!github_configured(&cfg.github));
+    }
+
+    #[test]
+    fn explicit_virtual_host_s3_style_is_preserved() {
+        assert!(!s3_force_path_style(Some(false)));
     }
 
     #[test]

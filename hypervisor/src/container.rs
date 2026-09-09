@@ -12,7 +12,7 @@ use std::{
 };
 
 use tokio::{
-    io::copy_bidirectional,
+    io::{AsyncReadExt, copy_bidirectional},
     net::{TcpListener, TcpStream},
     sync::{Mutex, Notify},
     task::JoinHandle,
@@ -36,7 +36,7 @@ impl fmt::Display for ContainerError {
         match self {
             Self::EmptyCommand => write!(f, "a container needs at least one argument to run"),
             Self::Package(err) => write!(f, "failed to load package: {err}"),
-            Self::Io(err) => write!(f, "network I/O failed: {err}"),
+            Self::Io(err) => write!(f, "I/O failed: {err}"),
             Self::IdlePoolExhausted => write!(f, "no idle containers are available"),
             Self::Engine(err) => write!(f, "container engine request failed: {err}"),
         }
@@ -138,7 +138,10 @@ impl Drop for PortMapping {
     }
 }
 
-pub struct SelectedTarball(PathBuf);
+pub struct SelectedTarball {
+    path: PathBuf,
+    bytes: bytes::Bytes,
+}
 
 pub struct InjectedContainer {
     id: String,
@@ -187,14 +190,50 @@ impl ContainerApi {
     pub async fn select_tarball(&self, path: impl Into<PathBuf>) -> Result<SelectedTarball> {
         let path = path.into();
         eprintln!("[container] select_tarball: path={}", path.display());
-        let metadata = tokio::fs::metadata(&path)
+        let file = tokio::fs::File::open(&path)
+            .await
+            .map_err(|e| ContainerError::Package(e.to_string()))?;
+        let metadata = file
+            .metadata()
             .await
             .map_err(|e| ContainerError::Package(e.to_string()))?;
         if !metadata.is_file() {
             return Err(ContainerError::Package("tarball path is not a file".into()));
         }
-        eprintln!("[container] select_tarball: ok size={}", metadata.len());
-        Ok(SelectedTarball(path))
+        if metadata.len() > crate::package::MAX_PACKAGE_ARCHIVE_SIZE {
+            return Err(ContainerError::Package(format!(
+                "archive is {} bytes; maximum is {} bytes",
+                metadata.len(),
+                crate::package::MAX_PACKAGE_ARCHIVE_SIZE
+            )));
+        }
+
+        // Bound the read as well as checking metadata so a concurrently grown
+        // file cannot make this process allocate an unbounded buffer.
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.take(crate::package::MAX_PACKAGE_ARCHIVE_SIZE + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|e| ContainerError::Package(e.to_string()))?;
+        if bytes.len() as u64 > crate::package::MAX_PACKAGE_ARCHIVE_SIZE {
+            return Err(ContainerError::Package(format!(
+                "archive exceeds the maximum size of {} bytes",
+                crate::package::MAX_PACKAGE_ARCHIVE_SIZE
+            )));
+        }
+
+        let size = bytes.len();
+        let bytes = tokio::task::spawn_blocking(move || {
+            crate::package::validate_archive(&bytes).map(|()| bytes)
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("package validation task failed: {error}")))?
+        .map_err(|error| ContainerError::Package(error.to_string()))?;
+        eprintln!("[container] select_tarball: ok size={size}");
+        Ok(SelectedTarball {
+            path,
+            bytes: bytes.into(),
+        })
     }
 
     pub async fn inject(
@@ -207,19 +246,17 @@ impl ContainerApi {
         }
         eprintln!(
             "[container] inject: tarball={} argv={:?}",
-            tarball.0.display(),
+            tarball.path.display(),
             argv
         );
-        let tar = tokio::fs::read(&tarball.0)
-            .await
-            .map_err(|e| ContainerError::Package(e.to_string()))?;
+        let tar = tarball.bytes;
         let id = self
             .idle
             .acquire()
             .await
             .ok_or(ContainerError::IdlePoolExhausted)?;
         eprintln!("[container] inject: id={id} uploading package into container...");
-        if let Err(error) = self.engine.upload_package(&id, tar.into()).await {
+        if let Err(error) = self.engine.upload_package(&id, tar).await {
             // The container may hold a partial extraction; destroy it rather
             // than returning a dirty slot to the pool. The pool maintainer
             // replaces it in the background.

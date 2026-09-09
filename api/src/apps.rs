@@ -47,7 +47,10 @@ pub fn validate_app_name(name: &str) -> Result<String, String> {
     Ok(trimmed.to_owned())
 }
 
-pub fn validate_icon(icon: &Option<String>, icon_kind: &Option<String>) -> Result<(Option<String>, Option<String>), String> {
+pub fn validate_icon(
+    icon: &Option<String>,
+    icon_kind: &Option<String>,
+) -> Result<(Option<String>, Option<String>), String> {
     let kind = icon_kind
         .as_deref()
         .map(str::trim)
@@ -61,45 +64,47 @@ pub fn validate_icon(icon: &Option<String>, icon_kind: &Option<String>) -> Resul
 
     match (&kind, &value) {
         (None, None) => Ok((None, None)),
-        (None, Some(_)) => Err("icon_kind is required when icon is set (emoji | icon | upload)".into()),
-        (Some(_), None) => Err("icon is required when icon_kind is set".into()),
-        (Some(k), Some(v)) => {
-            match k.as_str() {
-                "emoji" => {
-                    if v.chars().count() > 16 {
-                        return Err("emoji icon is too long".into());
-                    }
-                    Ok((Some(v.clone()), Some(k.clone())))
-                }
-                "icon" => {
-                    if v.len() > 64 {
-                        return Err("icon name is too long".into());
-                    }
-                    if !v.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-                        return Err("icon name may only contain letters, numbers, - and _".into());
-                    }
-                    Ok((Some(v.clone()), Some(k.clone())))
-                }
-                "upload" => {
-                    if v.len() > 1_000_000 {
-                        return Err("uploaded icon is too large".into());
-                    }
-                    Ok((Some(v.clone()), Some(k.clone())))
-                }
-                _ => Err("icon_kind must be one of: emoji, icon, upload".into()),
-            }
+        (None, Some(_)) => {
+            Err("icon_kind is required when icon is set (emoji | icon | upload)".into())
         }
+        (Some(_), None) => Err("icon is required when icon_kind is set".into()),
+        (Some(k), Some(v)) => match k.as_str() {
+            "emoji" => {
+                if v.chars().count() > 16 {
+                    return Err("emoji icon is too long".into());
+                }
+                Ok((Some(v.clone()), Some(k.clone())))
+            }
+            "icon" => {
+                if v.len() > 64 {
+                    return Err("icon name is too long".into());
+                }
+                if !v
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                {
+                    return Err("icon name may only contain letters, numbers, - and _".into());
+                }
+                Ok((Some(v.clone()), Some(k.clone())))
+            }
+            "upload" => {
+                if v.len() > 1_000_000 {
+                    return Err("uploaded icon is too large".into());
+                }
+                Ok((Some(v.clone()), Some(k.clone())))
+            }
+            _ => Err("icon_kind must be one of: emoji, icon, upload".into()),
+        },
     }
 }
 
-pub fn reject_id_change(raw: &serde_json::Value) -> Result<(), (Status, rocket::serde::json::Json<serde_json::Value>)> {
+pub fn reject_id_change(
+    raw: &serde_json::Value,
+) -> Result<(), (Status, rocket::serde::json::Json<serde_json::Value>)> {
     if let Some(obj) = raw.as_object() {
         for forbidden in ["id", "uuid", "owner_id", "ownerId", "app_id", "appId"] {
             if obj.contains_key(forbidden) {
-                return Err(json_error(
-                    Status::BadRequest,
-                    "changing id is not allowed",
-                ));
+                return Err(json_error(Status::BadRequest, "changing id is not allowed"));
             }
         }
     }
@@ -118,10 +123,15 @@ async fn load_owned_app(
     let raw: Option<String> = redis
         .hget(key_user_apps(github_id), app_id)
         .await
-        .map_err(|e| json_error(Status::ServiceUnavailable, format!("redis unavailable: {e}")))?;
+        .map_err(|e| {
+            json_error(
+                Status::ServiceUnavailable,
+                format!("redis unavailable: {e}"),
+            )
+        })?;
     let raw = raw.ok_or_else(|| json_error(Status::NotFound, "app not found"))?;
-    let app: App =
-        serde_json::from_str(&raw).map_err(|_| json_error(Status::InternalServerError, "stored app is corrupt"))?;
+    let app: App = serde_json::from_str(&raw)
+        .map_err(|_| json_error(Status::InternalServerError, "stored app is corrupt"))?;
     if app.owner_id != github_id {
         return Err(json_error(Status::NotFound, "app not found"));
     }
@@ -132,13 +142,21 @@ async fn load_owned_app(
 pub async fn list_apps(
     state: &State<ApiState>,
     token: SessionToken,
-) -> Result<rocket::serde::json::Json<serde_json::Value>, (Status, rocket::serde::json::Json<serde_json::Value>)> {
+) -> Result<
+    rocket::serde::json::Json<serde_json::Value>,
+    (Status, rocket::serde::json::Json<serde_json::Value>),
+> {
     let user = require_user(state, &token).await?;
     let mut redis = conn(state).await?;
     let map: std::collections::HashMap<String, String> = redis
         .hgetall(key_user_apps(user.github_id))
         .await
-        .map_err(|e| json_error(Status::ServiceUnavailable, format!("redis unavailable: {e}")))?;
+        .map_err(|e| {
+            json_error(
+                Status::ServiceUnavailable,
+                format!("redis unavailable: {e}"),
+            )
+        })?;
     let mut apps: Vec<App> = Vec::with_capacity(map.len());
     for raw in map.into_values() {
         if let Ok(app) = serde_json::from_str::<App>(&raw) {
@@ -148,7 +166,9 @@ pub async fn list_apps(
         }
     }
     apps.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-    Ok(rocket::serde::json::Json(serde_json::json!({ "apps": apps })))
+    Ok(rocket::serde::json::Json(
+        serde_json::json!({ "apps": apps }),
+    ))
 }
 
 #[post("/apps", data = "<body>")]
@@ -156,7 +176,10 @@ pub async fn create_app(
     state: &State<ApiState>,
     token: SessionToken,
     body: rocket::serde::json::Json<serde_json::Value>,
-) -> Result<(Status, rocket::serde::json::Json<serde_json::Value>), (Status, rocket::serde::json::Json<serde_json::Value>)> {
+) -> Result<
+    (Status, rocket::serde::json::Json<serde_json::Value>),
+    (Status, rocket::serde::json::Json<serde_json::Value>),
+> {
     let user = require_user(state, &token).await?;
     reject_id_change(&body)?;
     let parsed: CreateAppBody = serde_json::from_value(body.into_inner())
@@ -176,14 +199,26 @@ pub async fn create_app(
         created_at: now.clone(),
         updated_at: now,
     };
-    let raw = serde_json::to_string(&app)
-        .map_err(|e| json_error(Status::InternalServerError, format!("encode app failed: {e}")))?;
+    let raw = serde_json::to_string(&app).map_err(|e| {
+        json_error(
+            Status::InternalServerError,
+            format!("encode app failed: {e}"),
+        )
+    })?;
     let mut redis = conn(state).await?;
     redis
         .hset::<_, _, _, ()>(key_user_apps(user.github_id), app.id.clone(), raw)
         .await
-        .map_err(|e| json_error(Status::ServiceUnavailable, format!("redis unavailable: {e}")))?;
-    Ok((Status::Created, rocket::serde::json::Json(serde_json::json!({ "app": app }))))
+        .map_err(|e| {
+            json_error(
+                Status::ServiceUnavailable,
+                format!("redis unavailable: {e}"),
+            )
+        })?;
+    Ok((
+        Status::Created,
+        rocket::serde::json::Json(serde_json::json!({ "app": app })),
+    ))
 }
 
 #[get("/apps/<id>")]
@@ -191,7 +226,10 @@ pub async fn get_app(
     state: &State<ApiState>,
     token: SessionToken,
     id: &str,
-) -> Result<rocket::serde::json::Json<serde_json::Value>, (Status, rocket::serde::json::Json<serde_json::Value>)> {
+) -> Result<
+    rocket::serde::json::Json<serde_json::Value>,
+    (Status, rocket::serde::json::Json<serde_json::Value>),
+> {
     let user = require_user(state, &token).await?;
     let app = load_owned_app(state, user.github_id, id).await?;
     Ok(rocket::serde::json::Json(serde_json::json!({ "app": app })))
@@ -203,7 +241,10 @@ pub async fn update_app(
     token: SessionToken,
     id: &str,
     body: rocket::serde::json::Json<serde_json::Value>,
-) -> Result<rocket::serde::json::Json<serde_json::Value>, (Status, rocket::serde::json::Json<serde_json::Value>)> {
+) -> Result<
+    rocket::serde::json::Json<serde_json::Value>,
+    (Status, rocket::serde::json::Json<serde_json::Value>),
+> {
     let user = require_user(state, &token).await?;
     reject_id_change(&body)?;
     let mut app = load_owned_app(state, user.github_id, id).await?;
@@ -214,7 +255,10 @@ pub async fn update_app(
     let icon_kind_present = obj.get("icon_kind").is_some();
 
     if name.is_none() && !icon_present && !icon_kind_present {
-        return Err(json_error(Status::BadRequest, "nothing to update (want name, icon, icon_kind)"));
+        return Err(json_error(
+            Status::BadRequest,
+            "nothing to update (want name, icon, icon_kind)",
+        ));
     }
 
     if let Some(name) = name {
@@ -229,8 +273,14 @@ pub async fn update_app(
                 v.as_str().map(|s| s.to_owned())
             }
         });
-        if obj.get("icon").is_some_and(|v| !v.is_null() && v.as_str().is_none()) {
-            return Err(json_error(Status::BadRequest, "icon must be a string or null"));
+        if obj
+            .get("icon")
+            .is_some_and(|v| !v.is_null() && v.as_str().is_none())
+        {
+            return Err(json_error(
+                Status::BadRequest,
+                "icon must be a string or null",
+            ));
         }
         let icon_kind = obj.get("icon_kind").and_then(|v| {
             if v.is_null() {
@@ -239,8 +289,14 @@ pub async fn update_app(
                 v.as_str().map(|s| s.to_owned())
             }
         });
-        if obj.get("icon_kind").is_some_and(|v| !v.is_null() && v.as_str().is_none()) {
-            return Err(json_error(Status::BadRequest, "icon_kind must be a string or null"));
+        if obj
+            .get("icon_kind")
+            .is_some_and(|v| !v.is_null() && v.as_str().is_none())
+        {
+            return Err(json_error(
+                Status::BadRequest,
+                "icon_kind must be a string or null",
+            ));
         }
         let (icon, icon_kind) =
             validate_icon(&icon, &icon_kind).map_err(|e| json_error(Status::BadRequest, e))?;
@@ -249,13 +305,22 @@ pub async fn update_app(
     }
 
     app.updated_at = chrono::Utc::now().to_rfc3339();
-    let raw = serde_json::to_string(&app)
-        .map_err(|e| json_error(Status::InternalServerError, format!("encode app failed: {e}")))?;
+    let raw = serde_json::to_string(&app).map_err(|e| {
+        json_error(
+            Status::InternalServerError,
+            format!("encode app failed: {e}"),
+        )
+    })?;
     let mut redis = conn(state).await?;
     redis
         .hset::<_, _, _, ()>(key_user_apps(user.github_id), app.id.clone(), raw)
         .await
-        .map_err(|e| json_error(Status::ServiceUnavailable, format!("redis unavailable: {e}")))?;
+        .map_err(|e| {
+            json_error(
+                Status::ServiceUnavailable,
+                format!("redis unavailable: {e}"),
+            )
+        })?;
     Ok(rocket::serde::json::Json(serde_json::json!({ "app": app })))
 }
 
@@ -264,22 +329,71 @@ pub async fn delete_app(
     state: &State<ApiState>,
     token: SessionToken,
     id: &str,
-) -> Result<rocket::serde::json::Json<serde_json::Value>, (Status, rocket::serde::json::Json<serde_json::Value>)> {
+) -> Result<
+    rocket::serde::json::Json<serde_json::Value>,
+    (Status, rocket::serde::json::Json<serde_json::Value>),
+> {
     let user = require_user(state, &token).await?;
     let app = load_owned_app(state, user.github_id, id).await?;
     let mut redis = conn(state).await?;
+    let service_map: std::collections::HashMap<String, String> = redis
+        .hgetall(crate::services::key_user_app_services(
+            user.github_id,
+            &app.id,
+        ))
+        .await
+        .map_err(|e| {
+            json_error(
+                Status::ServiceUnavailable,
+                format!("redis unavailable: {e}"),
+            )
+        })?;
+    drop(redis);
 
+    for raw in service_map.into_values() {
+        let service: crate::services::Service = serde_json::from_str(&raw).map_err(|_| {
+            json_error(
+                Status::InternalServerError,
+                "stored service is corrupt; app cleanup was not completed",
+            )
+        })?;
+        if service.owner != user.github_id || service.app_id != app.id {
+            return Err(json_error(
+                Status::InternalServerError,
+                "stored service ownership is inconsistent; app cleanup was not completed",
+            ));
+        }
+        let _guard = state
+            .lock_service(user.github_id, &app.id, &service.id)
+            .await;
+        let service =
+            crate::services::load_owned_service(state, user.github_id, &app.id, &service.id)
+                .await?;
+        crate::services::cleanup_service(state, service).await?;
+    }
+
+    let mut redis = conn(state).await?;
     let _: () = redis
         .del(crate::services::key_user_app_services(
             user.github_id,
             &app.id,
         ))
         .await
-        .map_err(|e| json_error(Status::ServiceUnavailable, format!("redis unavailable: {e}")))?;
+        .map_err(|e| {
+            json_error(
+                Status::ServiceUnavailable,
+                format!("redis unavailable: {e}"),
+            )
+        })?;
     let _: () = redis
         .hdel(key_user_apps(user.github_id), app.id.clone())
         .await
-        .map_err(|e| json_error(Status::ServiceUnavailable, format!("redis unavailable: {e}")))?;
+        .map_err(|e| {
+            json_error(
+                Status::ServiceUnavailable,
+                format!("redis unavailable: {e}"),
+            )
+        })?;
     Ok(rocket::serde::json::Json(serde_json::json!({ "ok": true })))
 }
 

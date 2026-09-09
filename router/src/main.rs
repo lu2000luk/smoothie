@@ -1,6 +1,6 @@
 mod utils;
 
-use actix_web::{App, HttpResponse, HttpServer, Responder, get, web};
+use actix_web::{App, HttpResponse, HttpServer, Responder, delete, get, post, web};
 use dashmap::{DashMap, mapref::entry::Entry};
 use moka::future::Cache;
 use redis::AsyncCommands;
@@ -33,8 +33,49 @@ struct ContainerTarget {
     hypervisor_url: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum DeploymentStatus {
+    Running,
+    Deleted,
+}
+
+#[derive(Clone)]
+struct DeploymentBinding {
+    service_id: String,
+    package_id: String,
+    argv: Vec<String>,
+    container: ContainerTarget,
+    hypervisor_id: String,
+    host: String,
+    host_port: u16,
+    container_port: u16,
+    status: DeploymentStatus,
+}
+
+#[derive(Clone, Deserialize)]
+struct DeploymentRequest {
+    service_id: String,
+    package_id: String,
+    argv: Vec<String>,
+    port: u16,
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+struct DeploymentResponse {
+    deployment_id: String,
+    status: DeploymentStatus,
+    host: Option<String>,
+    host_port: Option<u16>,
+    container_port: Option<u16>,
+    container_id: Option<String>,
+}
+
 static BINDINGS: LazyLock<Arc<DashMap<String, Bind>>> = LazyLock::new(|| Arc::new(DashMap::new()));
 static ROUTE_LOCKS: LazyLock<DashMap<String, Arc<tokio::sync::Mutex<()>>>> =
+    LazyLock::new(DashMap::new);
+static DEPLOYMENTS: LazyLock<DashMap<String, DeploymentBinding>> = LazyLock::new(DashMap::new);
+static DEPLOYMENT_LOCKS: LazyLock<DashMap<String, Arc<tokio::sync::Mutex<()>>>> =
     LazyLock::new(DashMap::new);
 
 static REDIS_CLIENT: OnceLock<redis::Client> = OnceLock::new();
@@ -74,6 +115,7 @@ struct RunResponse {
 struct StartedContainer {
     id: String,
     host_port: u16,
+    container_port: u16,
 }
 
 async fn resolve_package_id(host: &str) -> Result<Option<String>, redis::RedisError> {
@@ -123,11 +165,13 @@ fn server_dial_host(server: &ServerConfig) -> Option<String> {
 async fn start_container(
     server: &ServerConfig,
     package_id: &str,
+    argv: &[String],
+    container_port: u16,
 ) -> Result<StartedContainer, String> {
     let base_url = hypervisor_base_url(&server.address);
     let inject_response = HTTP_CLIENT
         .post(format!("{base_url}/container/inject/{package_id}"))
-        .json(&serde_json::json!({}))
+        .json(&serde_json::json!({ "argv": argv }))
         .send()
         .await
         .map_err(|error| format!("inject request failed: {error}"))?;
@@ -144,7 +188,7 @@ async fn start_container(
         .map_err(|error| format!("invalid inject response: {error}"))?;
     let run_response = HTTP_CLIENT
         .post(format!("{base_url}/container/run/{}", injected.id))
-        .query(&[("port", 8080_u16)])
+        .query(&[("port", container_port)])
         .send()
         .await
         .map_err(|error| format!("run request failed: {error}"))?;
@@ -161,11 +205,12 @@ async fn start_container(
         .map(|response| StartedContainer {
             id: response.id,
             host_port: response.host_port,
+            container_port,
         })
         .map_err(|error| format!("invalid run response: {error}"))
 }
 
-async fn terminate_container(target: ContainerTarget) {
+async fn shutdown_container(target: &ContainerTarget) -> Result<(), String> {
     let response = HTTP_CLIENT
         .post(format!(
             "{}/container/shutdown/{}",
@@ -173,20 +218,21 @@ async fn terminate_container(target: ContainerTarget) {
         ))
         .timeout(Duration::from_secs(40))
         .send()
-        .await;
+        .await
+        .map_err(|error| format!("shutdown request failed: {error}"))?;
 
-    match response {
-        Ok(response) if response.status().is_success() => {
-            println!("Stopped idle container {}", target.id);
-        }
-        Ok(response) => {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            eprintln!(
-                "Failed to stop idle container {}: hypervisor returned {status}: {body}",
-                target.id
-            );
-        }
+    if response.status().is_success() || response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(());
+    }
+
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    Err(format!("shutdown returned {status}: {body}"))
+}
+
+async fn terminate_container(target: ContainerTarget) {
+    match shutdown_container(&target).await {
+        Ok(()) => println!("Stopped idle container {}", target.id),
         Err(error) => eprintln!("Failed to stop idle container {}: {error}", target.id),
     }
 }
@@ -214,6 +260,197 @@ async fn reap_idle_bindings(bindings: Arc<DashMap<String, Bind>>) {
             tokio::spawn(terminate_container(target));
         }
     }
+}
+
+fn validate_deployment_request(
+    deployment_id: &str,
+    request: &DeploymentRequest,
+) -> Result<(), &'static str> {
+    if deployment_id.trim().is_empty() {
+        return Err("deployment_id must not be empty");
+    }
+    if request.service_id.trim().is_empty() {
+        return Err("service_id must not be empty");
+    }
+    if request.package_id.trim().is_empty() {
+        return Err("package_id must not be empty");
+    }
+    if request.argv.is_empty() {
+        return Err("argv must not be empty");
+    }
+    if request.port == 0 {
+        return Err("port must not be zero");
+    }
+    Ok(())
+}
+
+fn find_running_deployment(
+    deployments: &DashMap<String, DeploymentBinding>,
+    deployment_id: &str,
+) -> Option<DeploymentBinding> {
+    deployments
+        .get(deployment_id)
+        .filter(|binding| binding.status == DeploymentStatus::Running)
+        .map(|binding| binding.clone())
+}
+
+fn deployment_matches_request(binding: &DeploymentBinding, request: &DeploymentRequest) -> bool {
+    binding.service_id == request.service_id
+        && binding.package_id == request.package_id
+        && binding.argv == request.argv
+        && binding.container_port == request.port
+}
+
+fn remove_deployment(
+    deployments: &DashMap<String, DeploymentBinding>,
+    deployment_id: &str,
+) -> Option<DeploymentBinding> {
+    deployments
+        .remove(deployment_id)
+        .map(|(_, binding)| binding)
+}
+
+fn deployment_response(deployment_id: &str, binding: &DeploymentBinding) -> DeploymentResponse {
+    DeploymentResponse {
+        deployment_id: deployment_id.to_owned(),
+        status: binding.status,
+        host: Some(binding.host.clone()),
+        host_port: Some(binding.host_port),
+        container_port: Some(binding.container_port),
+        container_id: Some(binding.container.id.clone()),
+    }
+}
+
+fn deleted_deployment_response(deployment_id: &str) -> DeploymentResponse {
+    DeploymentResponse {
+        deployment_id: deployment_id.to_owned(),
+        status: DeploymentStatus::Deleted,
+        host: None,
+        host_port: None,
+        container_port: None,
+        container_id: None,
+    }
+}
+
+#[post("/deployments/{deployment_id}")]
+async fn create_deployment(
+    deployment_id: web::Path<String>,
+    request: web::Json<DeploymentRequest>,
+) -> impl Responder {
+    let deployment_id = deployment_id.into_inner();
+    let request = request.into_inner();
+    if let Err(error) = validate_deployment_request(&deployment_id, &request) {
+        return HttpResponse::BadRequest().json(serde_json::json!({ "error": error }));
+    }
+
+    let deployment_lock = DEPLOYMENT_LOCKS
+        .entry(deployment_id.clone())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    let _deployment_guard = deployment_lock.lock().await;
+
+    if let Some(binding) = find_running_deployment(&DEPLOYMENTS, &deployment_id) {
+        if deployment_matches_request(&binding, &request) {
+            return HttpResponse::Ok().json(deployment_response(&deployment_id, &binding));
+        }
+        return HttpResponse::Conflict().json(serde_json::json!({
+            "error": "deployment_id is already running with different configuration"
+        }));
+    }
+
+    let Some(servers) = SERVERS.get() else {
+        return HttpResponse::InternalServerError()
+            .json(serde_json::json!({ "error": "SERVERS not initialized" }));
+    };
+    if servers.is_empty() {
+        return HttpResponse::ServiceUnavailable()
+            .json(serde_json::json!({ "error": "No servers configured" }));
+    }
+
+    let mut failures = Vec::new();
+    for server in utils::rank_servers(servers, &request.service_id) {
+        let Some(host) = server_dial_host(&server) else {
+            failures.push(format!("{}: invalid address", server.id));
+            continue;
+        };
+
+        match start_container(&server, &request.package_id, &request.argv, request.port).await {
+            Ok(container) => {
+                let binding = DeploymentBinding {
+                    service_id: request.service_id.clone(),
+                    package_id: request.package_id.clone(),
+                    argv: request.argv.clone(),
+                    container: ContainerTarget {
+                        id: container.id,
+                        hypervisor_url: hypervisor_base_url(&server.address),
+                    },
+                    hypervisor_id: server.id.clone(),
+                    host,
+                    host_port: container.host_port,
+                    container_port: container.container_port,
+                    status: DeploymentStatus::Running,
+                };
+                utils::record_server_request(&server.id, &request.service_id);
+                let response = deployment_response(&deployment_id, &binding);
+                DEPLOYMENTS.insert(deployment_id.clone(), binding);
+                return HttpResponse::Ok().json(response);
+            }
+            Err(error) => failures.push(format!("{}: {error}", server.id)),
+        }
+    }
+
+    eprintln!(
+        "Failed to start deployment {deployment_id} for package {}: {}",
+        request.package_id,
+        failures.join("; ")
+    );
+    HttpResponse::BadGateway().json(serde_json::json!({ "error": "All hypervisors failed" }))
+}
+
+#[get("/deployments/{deployment_id}")]
+async fn get_deployment(deployment_id: web::Path<String>) -> impl Responder {
+    let deployment_id = deployment_id.into_inner();
+    if deployment_id.trim().is_empty() {
+        return HttpResponse::BadRequest()
+            .json(serde_json::json!({ "error": "deployment_id must not be empty" }));
+    }
+
+    match find_running_deployment(&DEPLOYMENTS, &deployment_id) {
+        Some(binding) => HttpResponse::Ok().json(deployment_response(&deployment_id, &binding)),
+        None => {
+            HttpResponse::NotFound().json(serde_json::json!({ "error": "deployment not found" }))
+        }
+    }
+}
+
+#[delete("/deployments/{deployment_id}")]
+async fn delete_deployment(deployment_id: web::Path<String>) -> impl Responder {
+    let deployment_id = deployment_id.into_inner();
+    if deployment_id.trim().is_empty() {
+        return HttpResponse::BadRequest()
+            .json(serde_json::json!({ "error": "deployment_id must not be empty" }));
+    }
+
+    let deployment_lock = DEPLOYMENT_LOCKS
+        .entry(deployment_id.clone())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    let _deployment_guard = deployment_lock.lock().await;
+
+    let Some(binding) = find_running_deployment(&DEPLOYMENTS, &deployment_id) else {
+        return HttpResponse::Ok().json(deleted_deployment_response(&deployment_id));
+    };
+
+    if let Err(error) = shutdown_container(&binding.container).await {
+        return HttpResponse::BadGateway().json(serde_json::json!({ "error": error }));
+    }
+
+    remove_deployment(&DEPLOYMENTS, &deployment_id);
+    println!(
+        "Stopped deployment {deployment_id} for service {} package {} on hypervisor {}",
+        binding.service_id, binding.package_id, binding.hypervisor_id
+    );
+    HttpResponse::Ok().json(deleted_deployment_response(&deployment_id))
 }
 
 #[get("/route")]
@@ -297,7 +534,7 @@ async fn route(query: web::Query<RouteQuery>) -> impl Responder {
                 continue;
             };
 
-            match start_container(&server, &package_id).await {
+            match start_container(&server, &package_id, &["./main".into()], 8080).await {
                 Ok(container) => {
                     solved_host = Some(dial_host.clone());
                     solved_port = Some(container.host_port);
@@ -501,10 +738,18 @@ async fn main() -> std::io::Result<()> {
 
     tokio::spawn(reap_idle_bindings(BINDINGS.clone()));
 
-    HttpServer::new(|| App::new().service(hello).service(allow).service(route))
-        .bind((config.host.unwrap_or_else(|| "0.0.0.0".into()), port))?
-        .run()
-        .await
+    HttpServer::new(|| {
+        App::new()
+            .service(hello)
+            .service(allow)
+            .service(route)
+            .service(create_deployment)
+            .service(get_deployment)
+            .service(delete_deployment)
+    })
+    .bind((config.host.unwrap_or_else(|| "0.0.0.0".into()), port))?
+    .run()
+    .await
 }
 
 #[cfg(test)]
@@ -521,6 +766,108 @@ mod tests {
             },
             last,
         }
+    }
+
+    fn deployment_binding() -> DeploymentBinding {
+        DeploymentBinding {
+            service_id: "service-1".into(),
+            package_id: "package-1".into(),
+            argv: vec!["./server".into()],
+            container: ContainerTarget {
+                id: "container-1".into(),
+                hypervisor_url: "http://127.0.0.1:3100".into(),
+            },
+            hypervisor_id: "hypervisor-1".into(),
+            host: "127.0.0.1".into(),
+            host_port: 3000,
+            container_port: 8080,
+            status: DeploymentStatus::Running,
+        }
+    }
+
+    fn deployment_request() -> DeploymentRequest {
+        DeploymentRequest {
+            service_id: "service-1".into(),
+            package_id: "package-1".into(),
+            argv: vec!["./server".into()],
+            port: 8080,
+        }
+    }
+
+    #[test]
+    fn validates_explicit_deployment_requests() {
+        let mut request = deployment_request();
+        assert_eq!(
+            validate_deployment_request("deployment-1", &request),
+            Ok(())
+        );
+
+        assert_eq!(
+            validate_deployment_request("  ", &request),
+            Err("deployment_id must not be empty")
+        );
+
+        request.service_id = " ".into();
+        assert_eq!(
+            validate_deployment_request("deployment-1", &request),
+            Err("service_id must not be empty")
+        );
+        request = deployment_request();
+        request.package_id.clear();
+        assert_eq!(
+            validate_deployment_request("deployment-1", &request),
+            Err("package_id must not be empty")
+        );
+        request = deployment_request();
+        request.argv.clear();
+        assert_eq!(
+            validate_deployment_request("deployment-1", &request),
+            Err("argv must not be empty")
+        );
+        request = deployment_request();
+        request.port = 0;
+        assert_eq!(
+            validate_deployment_request("deployment-1", &request),
+            Err("port must not be zero")
+        );
+    }
+
+    #[test]
+    fn deployment_request_compatibility_uses_full_launch_config() {
+        let binding = deployment_binding();
+        let request = deployment_request();
+        assert!(deployment_matches_request(&binding, &request));
+
+        let mut changed = request.clone();
+        changed.service_id = "service-2".into();
+        assert!(!deployment_matches_request(&binding, &changed));
+
+        let mut changed = request.clone();
+        changed.package_id = "package-2".into();
+        assert!(!deployment_matches_request(&binding, &changed));
+
+        let mut changed = request.clone();
+        changed.argv.push("--production".into());
+        assert!(!deployment_matches_request(&binding, &changed));
+
+        let mut changed = request;
+        changed.port = 9090;
+        assert!(!deployment_matches_request(&binding, &changed));
+    }
+
+    #[test]
+    fn deployment_registry_lookup_and_removal_are_idempotent() {
+        let deployments = DashMap::new();
+        deployments.insert("deployment-1".into(), deployment_binding());
+
+        let first = find_running_deployment(&deployments, "deployment-1").unwrap();
+        let second = find_running_deployment(&deployments, "deployment-1").unwrap();
+        assert_eq!(first.container.id, "container-1");
+        assert_eq!(second.container.id, "container-1");
+        assert_eq!(deployments.len(), 1);
+
+        assert!(remove_deployment(&deployments, "deployment-1").is_some());
+        assert!(remove_deployment(&deployments, "deployment-1").is_none());
     }
 
     #[test]

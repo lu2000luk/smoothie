@@ -15,6 +15,24 @@ Container termination endpoints:
   not stop normally.
 - `POST /container/kill/{id}` immediately force-removes the container.
 
+## App packages
+
+App packages are uncompressed tar archives. Before an archive is uploaded to the
+container engine, the hypervisor requires:
+
+- at most 256 MiB of archive data, 4,096 entries, and 256 MiB total declared
+  extracted file data;
+- POSIX-relative entry paths, with no absolute paths, `..`, NUL bytes, or
+  backslash separators; safe aliases are normalized for duplicate checks;
+- only regular files and directories (no symbolic links, hard links, devices,
+  FIFOs, sparse metadata, or other special entry types), with no duplicate
+  normalized paths;
+- an executable regular file named `main` at the archive root.
+
+The default argv remains `["./main"]`; callers may provide a different argv to
+`POST /container/inject/{package_id}`. The requested application port remains
+the `port` query parameter on `POST /container/run/{id}` (default `8080`).
+
 ## Instant boxes
 
 `POST /box` creates a fresh container from the configured Alpine image, starts

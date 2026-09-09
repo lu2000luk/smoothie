@@ -8,7 +8,7 @@ mod port;
 
 use std::{collections::HashMap, sync::Arc};
 
-use actix_web::{App, HttpServer, web};
+use actix_web::{App, HttpServer, http::StatusCode, web};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -156,6 +156,23 @@ impl ResourceLimits {
     }
 }
 
+fn container_error_status(error: &container::ContainerError) -> StatusCode {
+    match error {
+        container::ContainerError::EmptyCommand | container::ContainerError::Package(_) => {
+            StatusCode::BAD_REQUEST
+        }
+        container::ContainerError::IdlePoolExhausted => StatusCode::SERVICE_UNAVAILABLE,
+        container::ContainerError::Io(_) | container::ContainerError::Engine(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+fn container_error_response(error: container::ContainerError) -> actix_web::HttpResponse {
+    actix_web::HttpResponse::build(container_error_status(&error))
+        .json(serde_json::json!({"error": error.to_string()}))
+}
+
 #[actix_web::get("/package/prepare/{id}")]
 async fn prepare_package_route(id: web::Path<String>) -> actix_web::HttpResponse {
     match package::prepare_package(&id).await {
@@ -194,18 +211,12 @@ async fn inject_container(
 
     let tarball = match state.api.select_tarball(tar_path).await {
         Ok(t) => t,
-        Err(e) => {
-            return actix_web::HttpResponse::InternalServerError()
-                .json(serde_json::json!({"error": e.to_string()}));
-        }
+        Err(e) => return container_error_response(e),
     };
 
     let injected = match state.api.inject(tarball, argv).await {
         Ok(i) => i,
-        Err(e) => {
-            return actix_web::HttpResponse::InternalServerError()
-                .json(serde_json::json!({"error": e.to_string()}));
-        }
+        Err(e) => return container_error_response(e),
     };
 
     let id = injected.id().to_string();
@@ -238,10 +249,7 @@ async fn run_container(
 
     let running = match state.api.run(entry.container, cport).await {
         Ok(r) => r,
-        Err(e) => {
-            return actix_web::HttpResponse::InternalServerError()
-                .json(serde_json::json!({"error": e.to_string()}));
-        }
+        Err(e) => return container_error_response(e),
     };
 
     let host_port = running.host_port();
@@ -275,8 +283,7 @@ async fn shutdown_container(
 
     match state.api.shutdown(entry.container).await {
         Ok(()) => actix_web::HttpResponse::Ok().json(serde_json::json!({"status": "ok"})),
-        Err(e) => actix_web::HttpResponse::InternalServerError()
-            .json(serde_json::json!({"error": e.to_string()})),
+        Err(e) => container_error_response(e),
     }
 }
 
@@ -295,8 +302,7 @@ async fn kill_container(
 
     match state.api.kill(entry.container).await {
         Ok(()) => actix_web::HttpResponse::Ok().json(serde_json::json!({"status": "ok"})),
-        Err(e) => actix_web::HttpResponse::InternalServerError()
-            .json(serde_json::json!({"error": e.to_string()})),
+        Err(e) => container_error_response(e),
     }
 }
 
@@ -540,4 +546,31 @@ removed on next startup",
     }
 
     result
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    #[test]
+    fn maps_container_errors_to_specific_http_statuses() {
+        assert_eq!(
+            container_error_status(&container::ContainerError::Package("invalid tar".into())),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            container_error_status(&container::ContainerError::EmptyCommand),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            container_error_status(&container::ContainerError::IdlePoolExhausted),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            container_error_status(&container::ContainerError::Io(std::io::Error::other(
+                "internal"
+            ))),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
 }

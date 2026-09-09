@@ -12,16 +12,6 @@ export interface App {
 	updated_at: string;
 }
 
-export interface Service {
-	id: string;
-	app_id: string;
-	owner_id: number;
-	name: string;
-	image?: string | null;
-	created_at: string;
-	updated_at: string;
-}
-
 function authHeaders(): HeadersInit {
 	const token = getSession();
 	return token
@@ -94,35 +84,5 @@ export async function deleteApp(id: string): Promise<void> {
 		method: 'DELETE',
 		headers: authHeaders()
 	});
-	await handle<{ ok: boolean }>(res);
-}
-
-export async function listServices(appId: string): Promise<Service[]> {
-	const res = await fetch(`${apiBase}/apps/${encodeURIComponent(appId)}/services`, {
-		headers: authHeaders()
-	});
-	const data = await handle<{ services: Service[] }>(res);
-	return data.services;
-}
-
-export async function createService(
-	appId: string,
-	name: string,
-	image?: string | null
-): Promise<Service> {
-	const res = await fetch(`${apiBase}/apps/${encodeURIComponent(appId)}/services`, {
-		method: 'POST',
-		headers: authHeaders(),
-		body: JSON.stringify({ name, image: image ?? null })
-	});
-	const data = await handle<{ service: Service }>(res);
-	return data.service;
-}
-
-export async function deleteService(appId: string, serviceId: string): Promise<void> {
-	const res = await fetch(
-		`${apiBase}/apps/${encodeURIComponent(appId)}/services/${encodeURIComponent(serviceId)}`,
-		{ method: 'DELETE', headers: authHeaders() }
-	);
 	await handle<{ ok: boolean }>(res);
 }
